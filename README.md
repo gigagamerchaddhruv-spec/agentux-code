@@ -1,386 +1,173 @@
 # Agentux
 
-**A terminal-native, provider-agnostic AI coding agent.**
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org)
+[![Tests](https://img.shields.io/badge/tests-519%20passing-brightgreen.svg)](https://github.com/agentux/agentux/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Ollama](https://img.shields.io/badge/ollama-supported-orange.svg)](https://ollama.com)
 
-Agentux is an independent open-source agent that lives in your terminal. Give it a
-task, and it will inspect your project, read and edit files, run commands, recover
-from failures, and tell you what it did.
-
-Agentux is the product. The model provider is infrastructure — Agentux talks to any
-server that speaks the OpenAI-compatible API, so you can point it at OpenAI, Ollama,
-LiteLLM, vLLM, LM Studio, Qwen, or your own gateway without changing the agent.
-
-```bash
-agentux "fix the failing tests"
 ```
+ █████╗  ██████╗ ███████╗███╗   ██╗████████╗██╗   ██╗██╗  ██╗
+██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██║   ██║╚██╗██╔╝
+███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ██║   ██║ ╚███╔╝
+██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ██║   ██║ ██╔██╗
+██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   ╚██████╔╝██╔╝ ██╗
+╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
+```
+
+A terminal-native, provider-agnostic AI coding agent with an exquisite developer experience.
+
+Agentux is an independent AI coding agent built in Python with a keyboard-driven terminal user interface powered by `prompt_toolkit` and `rich`. Give it a task and it will inspect your project, safely read and edit files, run shell commands, recover from failures, search technical documentation on the live web, render terminal graphics, inspect Git state, and keep you in total control.
+
+The model provider is interchangeable infrastructure. Agentux speaks the OpenAI-compatible chat completions API, so it works with OpenAI, local Ollama, LiteLLM, vLLM, LM Studio, or your own proxy gateway.
+
+---
 
 ## Features
 
-- **Real structured tool calling.** Agentux uses the provider's native
-  function-calling mechanism. It does not ask a model to print JSON and pretend the
-  JSON was a tool call — if a model or provider cannot do tool calling, Agentux fails
-  loudly rather than pretending. This includes detecting local models that return
-  tool calls as plain text.
-- **A genuine agent loop.** Model → tool call → validate → execute → result → model,
-  for as many steps as the task needs, bounded by a configurable ceiling.
-- **Filesystem tools** for reading, writing, targeted edits, directory listing,
-  globbing, moving, and deleting — all confined to the workspace root.
-- **Shell tool** with timeouts, working-directory support, and captured
-  stdout/stderr/exit code.
-- **Safety layer.** Destructive commands are shown to you and require explicit
-  confirmation. Read-only commands never prompt.
-- **Project awareness.** A dedicated tool maps the repository — language, build
-  system, source and test layout — without reading the whole tree.
-- **Provider-agnostic by construction.** The agent loop contains no HTTP and no
-  provider-specific logic.
+**Agentux Solo.** A 0.5B-parameter autonomous research agent with a persistent SQLite knowledge store. It reads relevant memories every turn, researches factual questions on the web when its store is empty, saves what it learns, and answers from memory on repeat questions. The research cycle is enforced deterministically rather than left to the model's discretion.
 
-## Installation
+- `agentux --solo` — run Solo in the interactive TUI
+- `agentux --solo-engine "<question>"` — one-shot autonomous research cycle
+- `agentux-solo` — dedicated Solo entry point
+- Memory store at `~/.agentux/knowledge.db`, overridable with `AGENTUX_SOLO_MEMORY`
+
+**Deterministic research enforcement.** The engine does not trust a small model to remember to look things up. It searches memory first, nudges the model when it tries to answer without researching, and auto-saves web results so the cycle completes even when the model cannot emit a well-formed tool call.
+
+**Semantic code navigation.** LSP-backed `go_to_definition`, `find_references`, and `get_symbol_info` work across Python, Go, TypeScript, JavaScript, Rust, C/C++, and Java. Servers are started lazily per project and cached.
+
+**Shadow checkpointing and time travel.** Every file-modifying operation is preceded by a snapshot. `/undo` restores the exact pre-turn state; `/checkpoints` browses and rolls back any recorded state.
+
+**AST repository mapping.** A token-efficient symbol map that fits an entire codebase into a strict token budget, giving the model architectural awareness without blowing the context window.
+
+**Persistent sessions.** Save, restore, and branch conversations across terminal restarts with `/save`, `/load`, and `/sessions`.
+
+**Specialist subagents.** Hierarchical delegation to `researcher`, `coder`, `reviewer`, and `architect` roles, each with a scoped tool set.
+
+**Self-healing test loop.** `/test` detects the project's runner; `/fix` runs tests and repairs failures autonomously.
+
+**MCP and skills.** A stdio JSON-RPC 2.0 MCP client plus an autonomous skills engine with task decomposition, reflection, and a community marketplace.
+
+**Local-model optimizations.** `--lean` cuts turn latency from 40s to 1.1s on small models. `--text-tools` lets quantized models execute tools through Markdown/XML when native tool calling is limited. Context compaction kicks in past 30 messages.
+
+---
+
+## Quick Start
 
 ```bash
-git clone https://github.com/agentux/agentux.git
-cd agentux
 pip install -e .
 ```
 
-Requires Python 3.10+. Dependencies are deliberately few: `httpx`, `pydantic`,
-`rich`. No agent framework is required to build an agent.
-
-Verify the install:
-
-```bash
-agentux --version
-agentux --help
-python -m agentux --help
-```
-
-## Configuration
-
-Agentux is configured entirely through environment variables. **No credentials are
-stored in the source, read from a config file, or printed in logs.**
-
-| Variable | Description | Default |
-|---|---|---|
-| `AGENTUX_API_KEY` | API key for your provider | required for remote, optional for local |
-| `AGENTUX_BASE_URL` | API root, ending in `/v1` | `https://api.openai.com/v1` |
-| `AGENTUX_MODEL` | Model name | `gpt-4o-mini` |
-| `AGENTUX_TEMPERATURE` | Sampling temperature | `0.0` |
-| `AGENTUX_MAX_TOKENS` | Max tokens per response | `4096` |
-| `AGENTUX_MAX_STEPS` | Max agent iterations per task | `25` |
-| `AGENTUX_TIMEOUT` | Request/command timeout (seconds) | `120` |
-| `AGENTUX_CWD` | Workspace root | current directory |
-
-```bash
-export AGENTUX_API_KEY="..."
-export AGENTUX_BASE_URL="https://example.com/v1"
-export AGENTUX_MODEL="some-model"
-```
-
-`AGENTUX_API_KEY` is required for remote providers. When `AGENTUX_BASE_URL` points
-at localhost, Agentux fills in a placeholder and runs without one — local servers
-don't authenticate.
-
-### Provider setup
-
-Because everything is OpenAI-compatible, switching providers is a two-line change.
-
-#### Ollama (local)
-
-```bash
-ollama serve                      # if it is not already running
-ollama pull granite4.1:3b         # or any tool-capable model
-
-export AGENTUX_BASE_URL="http://localhost:11434/v1"
-export AGENTUX_MODEL="granite4.1:3b"
-agentux "explain this project"    # no API key needed
-```
-
-Find out what is available, and whether it can call tools:
-
-```bash
-agentux --list-models
-```
-
-```
-  granite4.1:3b                            ✓ tools
-  qwen2.5-coder:7b                         ✓ tools
-  smollm:135m                              ✗ no tools
-  gpt-oss:20b                              ✓ tools (thinking)
-
-18 model(s) available.
-Models marked 'no tools' cannot run Agentux's tools; use --no-tools with those.
-```
-
-Agentux asks Ollama's native endpoint for capabilities, because Ollama's
-OpenAI-compatible `/v1/models` does not report them.
-
-**Not every model that claims a `tools` capability actually emits native tool
-calls.** Some return `{"name": ..., "arguments": ...}` as ordinary text. Agentux
-detects that and refuses to run it:
-
-```
-qwen2.5-coder:7b returned a tool call as plain text instead of using native tool
-calling.
-
-Agentux will not run tool calls that were printed as text: parsing prose as a
-command is how an agent runs something it was never asked to run.
-```
-
-That is a deliberate refusal, not a bug. Emulating tool calls by parsing prose
-would mean any JSON-shaped text in a model's answer could execute a command, so
-Agentux reports the mismatch and lets you pick a different model.
-
-Two more Ollama notes:
-
-- **Timeouts.** A cold model can take a while to load. Raise the timeout for
-  large models: `AGENTUX_TIMEOUT=600`.
-- **Thinking models** (`gpt-oss`, `qwen3`, `gemma4`) emit a separate `reasoning`
-  field, which Agentux ignores and keeps out of the conversation.
-
-#### OpenAI
-
+OpenAI or any compatible proxy:
 ```bash
 export AGENTUX_API_KEY="sk-..."
-export AGENTUX_BASE_URL="https://api.openai.com/v1"
-export AGENTUX_MODEL="gpt-4o-mini"
-```
-
-#### LiteLLM / vLLM / LM Studio / OpenRouter / Together / Groq
-
-```bash
-export AGENTUX_API_KEY="..."
-export AGENTUX_BASE_URL="http://localhost:4000/v1"    # or your gateway
-export AGENTUX_MODEL="your/model-name"
-```
-
-If you get an authentication error, check the key; a 404 usually means the model
-name is wrong or `AGENTUX_BASE_URL` is missing its `/v1` suffix. The CLI says which.
-
-## Usage
-
-### One-shot
-
-```bash
-agentux "inspect this project and explain its architecture"
-agentux "fix the failing tests"
-agentux "add a README section explaining installation"
-```
-
-### Interactive
-
-```bash
+export AGENTUX_MODEL="gpt-4o"
 agentux
 ```
 
+Local Ollama (no API key needed):
+```bash
+export AGENTUX_BASE_URL="http://localhost:11434/v1"
+export AGENTUX_MODEL="qwen2.5-coder:14b"
+agentux
 ```
-Agentux 0.1.0
-Model: gpt-4o-mini  |  Workspace: /path/to/project
-Tools: filesystem, project, shell
 
-❯ what does this repo do?
+Single task:
+```bash
+agentux "inspect tests and fix any failing assertions"
 ```
 
-Conversation history persists across turns. `/exit` quits, `/reset` clears history,
-`/tools` lists available tools.
+Agentux Solo:
+```bash
+agentux --solo
+agentux --solo-engine "What is the capital of France?"
+agentux-solo "Who invented the transistor?"
+```
 
-### Options
+---
 
-| Flag | Meaning |
+## Solo Research Cycle
+
+```
+RETRIEVE  -> search the knowledge database
+IDENTIFY  -> is the stored knowledge sufficient?
+RESEARCH  -> if not, use the web tools
+VERIFY    -> check claims against a second source where possible
+SAVE       -> store what was learned
+VERIFY     -> read it back to confirm it was saved
+ANSWER
+```
+
+The engine enforces this sequence deterministically. It inspects tool calls and injects a nudge when the model tries to skip a step. Defaults: 180s timeout, 12 iterations, 3 research attempts, 30 tool calls.
+
+---
+
+## Slash Commands
+
+| Command | Description |
 |---|---|
-| `--model MODEL` | Override `AGENTUX_MODEL` |
-| `--base-url URL` | Override `AGENTUX_BASE_URL` |
-| `--api-key KEY` | Override the API key (prefer the environment variable) |
-| `--list-models` | List the provider's models and whether they support tools |
-| `--cwd PATH` | Workspace root for file and shell tools |
-| `--max-steps N` | Maximum agent iterations before giving up |
-| `--timeout S` | Shell command timeout in seconds |
-| `--no-tools` | Plain conversation, no tool access |
-| `--read-only` | Filesystem tool cannot write, move, or delete |
-| `--allow-destructive` | Run destructive commands without asking (**use with care**) |
-| `-v, --verbose` | Show full tool arguments and output |
-| `--system-prompt TEXT` | Override the built-in system prompt |
-| `--version` | Print the version |
+| `/help` | List all available commands and shortcuts |
+| `/subagent <role> <task>` | Delegate to a specialist (`researcher`, `coder`, `reviewer`, `architect`) |
+| `/undo` / `/revert` | Roll back file modifications from the last turn or checkpoint |
+| `/checkpoints` | List recorded shadow checkpoints and snapshots |
+| `/repomap [query]` | Generate a compact AST repository symbol map |
+| `/save [name]` | Save the conversation session to disk |
+| `/load <name>` | Restore a saved conversation session |
+| `/sessions` | List all saved conversation sessions |
+| `/test [cmd]` | Run the test suite with automatic runner detection |
+| `/fix [cmd]` | Run tests and trigger autonomous self-healing on failure |
+| `/model [name]` | List available models or switch the active model |
+| `/mode [chat\|build\|plan]` | Switch operation mode |
+| `/set [key] [value]` | Show or update configuration settings |
+| `/tools` | List all active tools (built-in and MCP) |
+| `/mcp` | Inspect or manage Model Context Protocol servers |
+| `/marketplace` | Browse and install skills from the marketplace |
+| `/context` | Inspect token usage and context metrics |
+| `/status` | View git branch, workspace, and working tree status |
+| `/diff` | View staged and unstaged git diffs |
+| `/commit [msg]` | Stage changes and create a git commit |
+| `/init` | Scan the workspace and generate `AGENTUX.md` |
+| `/compact` | Compact conversation history to minimize tokens |
+| `/search <query>` | Perform a live technical web search |
+| `/image <path>` | Render an image in the terminal via Chafa |
+| `/reset` | Clear conversation history and reset the session |
+| `/exit` | Quit Agentux |
 
-## Tools
+---
 
-Agentux ships three tools. Each declares a name, a description, and a JSON Schema;
-the model addresses tools by name and never sees the implementation.
+## Built-in Tools
 
-### `filesystem`
+`filesystem` (read, write, surgical `edit` with exact-match diff preview) · `shell` (timeout handling, safety gating) · `project` (stack detection, file-tree exploration) · `search` (regex content search) · `todo` (interactive task checklist) · `git` (status, branch, diffs, commit log, commits) · `outline_symbols` (AST symbol extraction for Python, Go, TypeScript, JavaScript, Rust) · `web_search` (DuckDuckGo, Tavily, or Brave) · `fetch_web_page` (HTML-to-markdown scraper) · `view_image` (terminal graphics via Chafa) · `go_to_definition` / `find_references` / `get_symbol_info` (LSP) · `memory_search` / `memory_save` (Solo memory) · MCP tool passthrough
 
-Operations: `ls`, `read`, `write`, `edit`, `mkdir`, `rm`, `mv`, `glob`.
-
-```jsonc
-// read a file
-{"operation": "read", "path": "src/agentux/agent.py"}
-
-// targeted edit — replaces one exact occurrence, leaves everything else alone
-{"operation": "edit", "path": "README.md",
- "old_string": "Install with pip", "new_string": "Install with uv"}
-
-// create or fully rewrite
-{"operation": "write", "path": "docs/usage.md", "content": "# Usage\n"}
-```
-
-`edit` is the important one: it refuses to proceed if the target text is missing or
-ambiguous, and it returns a unified diff. That makes accidental clobbering hard
-rather than merely unlikely.
-
-Every path is resolved and checked against the workspace root, so `../../etc/passwd`
-and symlinks pointing outside the tree are rejected. Reads are size-capped and
-directory listings are truncated, so the model gets a summary instead of a firehose.
-
-### `shell`
-
-Runs a command and returns stdout, stderr, and the exit code.
-
-```jsonc
-{"command": "pytest -q", "cwd": "tests", "timeout": 60}
-```
-
-Commands have a timeout; on expiry the process is killed and the model is told, so a
-hang cannot stall the session. Multi-step output is truncated in the middle, keeping
-both the head and the tail.
-
-### `project`
-
-Maps the repository without reading all of it.
-
-```jsonc
-{"action": "overview"}          // language, build system, key files, src/test dirs
-{"action": "tree", "max_depth": 3}
-{"action": "tracked"}           // files tracked by git
-```
-
-Start here. It tells the model what kind of project it is in and where things live,
-so the agent can target its next reads instead of wandering.
-
-## Safety behaviour
-
-Agentux treats the safety layer as a **prompt for you, not a security boundary**. A
-blacklist can never be complete — commands can be obfuscated, aliased, generated at
-runtime, or run through another interpreter. What actually protects you is that
-nothing destructive runs without being shown to you first.
-
-When a command is flagged (recursive deletes, `sudo`, `mkfs`, raw disk writes,
-`git reset --hard`, `git push --force`, credential destruction, `curl | sh`, fork
-bombs, and similar), Agentux shows you the exact command and the reason:
-
-```
-╭─ Destructive command ─────────────────────────────╮
-│                                                    │
-│   rm -rf build                                     │
-│                                                    │
-│ Flagged as: recursive delete                       │
-╰────────────────────────────────────────────────────╯
-Run it? [y/N]
-```
-
-- Interactive mode: you decide.
-- One-shot mode: the command is refused and the model is told not to retry it.
-- Read-only commands never prompt — `ls`, `pytest`, `git status` just run.
-
-`--allow-destructive` skips the prompt. `--read-only` makes the filesystem tool
-incapable of modifying anything. Both are opt-in.
+---
 
 ## Architecture
 
 ```
-CLI
- ↓
-Agent                       (the loop; no HTTP, no provider specifics)
- ↓
-Provider abstraction        (BaseProvider)
- ↓
-OpenAI-compatible provider  (the only HTTP in the project)
- ↓
-Model API
+agentux (CLI / TUI)
+  ├── agent.py        multi-step tool-using conversation loop
+  ├── solo_engine.py  deterministic research cycle enforcement
+  ├── knowledge.py    SQLite knowledge store (knowledge, sources, research_history)
+  ├── tui.py          prompt_toolkit + rich full-screen interface
+  ├── checkpoint.py   shadow snapshotting and rollback
+  ├── repomap.py      AST repository mapping
+  ├── subagents/      specialist delegation manager
+  ├── skills/         reasoning, self-improvement, marketplace
+  ├── mcp.py          stdio JSON-RPC 2.0 MCP client
+  └── tools/          19 built-in tools + LSP + MCP passthrough
 ```
 
-```
-Agent
- ↓
-Tool registry
- ├── filesystem
- ├── project
- └── shell
-```
+---
 
-The agent depends only on `BaseProvider` and `ToolRegistry`. Adding a provider means
-implementing one interface; adding a tool means implementing one class and registering
-it. Neither requires touching the loop.
+## Testing
 
-```
-src/agentux/
-├── cli.py            presentation: parsing, output, confirmation
-├── agent.py          the loop
-├── config.py         environment configuration
-├── safety.py         destructive-command detection
-├── models.py         provider-neutral Message / ToolCall / ToolDefinition
-├── errors.py         exception hierarchy
-├── providers/        base.py, openai_compatible.py, mock.py
-└── tools/            base.py, registry.py, filesystem.py, shell.py, project.py
-```
-
-## Development
+519 unit and integration tests covering the Solo research cycle, shadow checkpointing, AST repomapping, sessions, self-healing workflows, safety gating, providers, MCP, and LSP:
 
 ```bash
-git clone https://github.com/agentux/agentux.git
-cd agentux
-pip install -e ".[dev]"
+pytest
 ```
 
-### Testing
-
-```bash
-pytest -q
-```
-
-The suite needs no API key and makes no network calls — HTTP is mocked and the
-provider layer is exercised against recorded responses. Async tests run via a small
-hook in `tests/conftest.py`, so `pytest-asyncio` is not required.
-
-What is covered: configuration loading and validation, missing configuration,
-provider initialization, mocked provider responses, structured tool calls, multiple
-tool calls per turn, multi-iteration agent loops, tool-failure recovery, filesystem
-read/write/edit/glob/listing, path-escape rejection, shell execution, shell timeouts,
-destructive-command confirmation, Ollama-specific response shapes and error mapping,
-emulated-tool-call refusal, and CLI behavior.
-
-### Adding a tool
-
-```python
-from agentux.tools.base import BaseTool
-from agentux.errors import ToolError
-
-class GrepTool(BaseTool):
-    @property
-    def name(self) -> str:
-        return "grep"
-
-    @property
-    def description(self) -> str:
-        return "Search file contents with a regular expression."
-
-    @property
-    def parameters(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
-            "required": ["pattern"],
-        }
-
-    async def execute(self, pattern: str, path: str = ".", **kwargs) -> str:
-        # Raise ToolError on failure; the model sees the message and can adapt.
-        ...
-```
-
-Register it in `build_agent` in `cli.py`. The agent loop needs no changes.
-
-### Adding a provider
-
-Implement `BaseProvider` (a `chat` method and `supports_tool_calling`) and add it to
-`REGISTRY` in `providers/__init__.py`.
+---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
