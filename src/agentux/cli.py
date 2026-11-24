@@ -1080,7 +1080,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             if getattr(args, "web", False):
                 from .web import WebServer
                 agent = build_agent(config, args, mcp_manager=manager, stream=stream)
-                web_server = WebServer(agent, config, port=getattr(args, "port", 8080))
+                try:
+                    web_server = WebServer(agent, config, port=getattr(args, "port", 8080))
+                except RuntimeError as exc:
+                    console.print(f"[bold red]⌋ web console error[/bold red] {exc}")
+                    return 1
                 web_server.start(open_browser=getattr(args, "open", False))
                 console.print(f"\n  [bold #00ff88]⏣ AGENTUX · Web Console[/bold #00ff88]\n")
                 console.print(f"  • Local URL:      [bold cyan]{web_server.url}[/bold cyan]")
