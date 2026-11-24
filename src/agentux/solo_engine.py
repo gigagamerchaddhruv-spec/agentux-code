@@ -24,6 +24,7 @@ and injecting a nudge when the model tries to skip a step.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -48,6 +49,21 @@ from .tools.knowledge_tool import (
 )
 from .tools.registry import ToolRegistry
 from .tools.web import FetchWebPageTool, WebSearchTool
+
+# Coding tools are shared with the main agent. They are imported lazily so
+# that Solo keeps working on a minimal install that only needs the web and
+# knowledge tooling.
+from .checkpoint import CheckpointManager
+from .tools.checkpoint_tool import CheckpointTool
+from .tools.filesystem import FilesystemTool
+from .tools.git import GitTool
+from .tools.image import ViewImageTool
+from .tools.project import ProjectTool
+from .tools.repomap_tool import RepomapTool
+from .tools.search import SearchTool
+from .tools.shell import ShellTool
+from .tools.symbols import OutlineSymbolsTool
+from .tools.todo import TodoTool
 
 #: Maximum wall-clock seconds for a whole Solo run.
 DEFAULT_TIMEOUT = 180.0
@@ -131,6 +147,22 @@ class SoloEngine:
         self.registry.register(self._web_search)
         self.registry.register(self._fetch_web_page)
         self.registry.register(SearchMultipleTool(self._web_search.search))
+
+        # Solo is a coding agent, not a research-only one. Give it the same
+        # workspace tools the main agent gets so it can read, edit, run, and
+        # test code rather than only looking things up.
+        self._root = project or os.getcwd()
+        self._checkpoint_manager = CheckpointManager(self._root)
+        self.registry.register(FilesystemTool(root=self._root))
+        self.registry.register(ShellTool(cwd=self._root, timeout=self.timeout))
+        self.registry.register(ProjectTool(root=self._root))
+        self.registry.register(SearchTool(root=self._root))
+        self.registry.register(OutlineSymbolsTool(root=self._root))
+        self.registry.register(GitTool(root=self._root, timeout=self.timeout))
+        self.registry.register(TodoTool())
+        self.registry.register(ViewImageTool(root=self._root))
+        self.registry.register(RepomapTool(root=self._root))
+        self.registry.register(CheckpointTool(self._checkpoint_manager))
         self._last_search_output = ""
 
     # ------------------------------------------------------------------
@@ -390,6 +422,20 @@ class SoloEngine:
             tool = self.registry.get(call.name)
         except Exception:
             return f"ERROR: unknown tool '{call.name}'"
+
+        # Automatic shadow checkpoint before a mutating filesystem call,
+        # mirroring the main agent so Solo changes are reversible.
+        if call.name == "filesystem":
+            op = call.arguments.get("operation")
+            path = call.arguments.get("path")
+            if op in ("write", "edit") and path:
+                if not getattr(self, "_current_turn_checkpoint", None):
+                    self._current_turn_checkpoint = self._checkpoint_manager.create_checkpoint(
+                        f"Before {op} on {path}"
+                    )
+                self._checkpoint_manager.capture_file_before(
+                    path, self._current_turn_checkpoint.id
+                )
 
         record(SoloEvent("tool_start", f"Running {call.name}..."))
         try:

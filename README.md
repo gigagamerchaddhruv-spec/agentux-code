@@ -49,6 +49,24 @@ The model provider is interchangeable infrastructure. Agentux speaks the OpenAI-
 
 **Local-model optimizations.** `--lean` cuts turn latency from 40s to 1.1s on small models. `--text-tools` lets quantized models execute tools through Markdown/XML when native tool calling is limited. Context compaction kicks in past 30 messages.
 
+**Lua addon system.** Community scripts that hook the agent lifecycle. Drop a `.lua` file in `~/.agentux/addons/` or `<workspace>/.agentux/addons/` and it loads automatically. Addons run in a sandboxed LuaJIT runtime and can mutate prompts, intercept tool calls, rewrite answers, and observe events.
+
+```lua
+-- ~/.agentux/addons/prefix.lua
+agentux.register({
+    name = "prefixer",
+    version = "1.0",
+    on_prompt = function(p)
+        return "[prefixed] " .. p
+    end,
+    on_answer = function(a)
+        return a .. " [signed]"
+    end,
+})
+```
+
+Available hooks: `on_start`, `on_prompt`, `on_system_prompt`, `on_tool_call`, `on_tool_result`, `on_answer`, `on_event`. Addons can also block tool calls or rewrite their arguments.
+
 ---
 
 ## Quick Start

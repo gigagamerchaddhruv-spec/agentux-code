@@ -100,6 +100,7 @@ class StubWebSearch:
 
 def make_engine(tmp_path, provider, web=None, **kwargs):
     knowledge = KnowledgeStore(path=str(tmp_path / "knowledge.db"))
+    kwargs.setdefault("project", str(tmp_path))
     engine = SoloEngine(provider, knowledge, web_search=web, **kwargs)
     return engine, knowledge
 
@@ -393,6 +394,104 @@ async def test_engine_handles_non_question_without_research(tmp_path):
     result = await engine.run("hello")
 
     assert web.queries == []
+    assert result.answer
+    knowledge.close()
+
+
+# ----------------------------------------------------------------------
+# Coding tools & shadow checkpointing
+# ----------------------------------------------------------------------
+async def test_solo_has_coding_tools(tmp_path):
+    """Solo is a coding agent: it gets the same workspace tools as the main
+    agent, not just research and knowledge tools."""
+    engine, knowledge = make_engine(tmp_path, ScriptedProvider([]))
+    names = {t.name for t in engine.registry.list_tools()}
+    for expected in ("filesystem", "shell", "project", "search", "outline_symbols",
+                     "git", "todo", "view_image", "repomap", "checkpoint"):
+        assert expected in names, f"Solo is missing the {expected} tool"
+    knowledge.close()
+
+
+async def test_solo_can_read_and_edit_files(tmp_path):
+    """Solo can inspect and modify the workspace, not just look things up."""
+    (tmp_path / "hello.txt").write_text("original")
+    provider = ScriptedProvider([
+        tool_call("filesystem", operation="read", path="hello.txt"),
+        tool_call("filesystem", operation="write", path="hello.txt", content="changed"),
+        Message(role="assistant", content="Done."),
+    ])
+    engine, knowledge = make_engine(tmp_path, provider)
+    result = await engine.run("read and modify hello.txt")
+
+    assert result.answer
+    assert (tmp_path / "hello.txt").read_text() == "changed"
+    knowledge.close()
+
+
+async def test_solo_captures_shadow_checkpoints(tmp_path):
+    """Every mutating filesystem call is preceded by a shadow snapshot, so
+    Solo changes are reversible the same way the main agent's are."""
+    (tmp_path / "hello.txt").write_text("original")
+    provider = ScriptedProvider([
+        tool_call("filesystem", operation="write", path="hello.txt", content="changed"),
+        Message(role="assistant", content="Done."),
+    ])
+    engine, knowledge = make_engine(tmp_path, provider)
+    await engine.run("modify hello.txt")
+
+    checkpoints = engine._checkpoint_manager.list_checkpoints()
+    assert len(checkpoints) == 1
+    assert checkpoints[0].description.startswith("Before write on hello.txt")
+    knowledge.close()
+
+
+async def test_solo_rollback_restores_files(tmp_path):
+    """The checkpoint lets Solo undo its own edits."""
+    (tmp_path / "hello.txt").write_text("original")
+    provider = ScriptedProvider([
+        tool_call("filesystem", operation="write", path="hello.txt", content="changed"),
+        Message(role="assistant", content="Done."),
+    ])
+    engine, knowledge = make_engine(tmp_path, provider)
+    await engine.run("modify hello.txt")
+    assert (tmp_path / "hello.txt").read_text() == "changed"
+
+    ok, _msg = engine._checkpoint_manager.rollback()
+    assert ok is True
+    assert (tmp_path / "hello.txt").read_text() == "original"
+    knowledge.close()
+
+
+async def test_solo_runs_shell_commands(tmp_path):
+    """Solo can execute workspace commands, not just read files."""
+    provider = ScriptedProvider([
+        tool_call("shell", command="echo hello"),
+        Message(role="assistant", content="Done."),
+    ])
+    engine, knowledge = make_engine(tmp_path, provider)
+    result = await engine.run("run a command")
+
+    assert result.answer
+    knowledge.close()
+
+
+async def test_solo_uses_git_tool(tmp_path):
+    """Solo can inspect git state the same way the main agent can."""
+    import subprocess
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, capture_output=True)
+    (tmp_path / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+
+    provider = ScriptedProvider([
+        tool_call("git", action="status"),
+        Message(role="assistant", content="Clean."),
+    ])
+    engine, knowledge = make_engine(tmp_path, provider)
+    result = await engine.run("check git status")
+
     assert result.answer
     knowledge.close()
 
