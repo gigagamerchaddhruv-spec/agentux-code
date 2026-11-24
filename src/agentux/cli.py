@@ -2,6 +2,9 @@
 
 Presentation only: argument parsing, terminal output, and the confirmation
 prompt live here. Everything substantive is in :mod:`agentux.agent`.
+
+MCP is optional. If no servers are configured -- or every one of them fails to
+start -- Agentux runs exactly as it did before, with its built-in tools.
 """
 
 from __future__ import annotations
@@ -10,15 +13,17 @@ import argparse
 import asyncio
 import os
 import sys
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 
 from . import __version__
 from .agent import Agent
 from .config import Config, load_config
+from .context import ContextManager
 from .errors import (
     AgentuxError,
     AuthenticationError,
@@ -30,11 +35,21 @@ from .errors import (
     UnsupportedToolCallingError,
     UserAbort,
 )
+from .mcp_config import global_config_path, project_config_path
+from .modelpicker import discover_models, handle_model, render_model_table
 from .providers.openai_compatible import OpenAICompatibleProvider
 from .tools.filesystem import FilesystemTool
+from .tools.git import GitTool
+from .tools.image import ViewImageTool
 from .tools.project import ProjectTool
 from .tools.registry import ToolRegistry
+from .tools.search import SearchTool
 from .tools.shell import ShellTool
+from .tools.symbols import OutlineSymbolsTool
+from .tools.todo import TodoTool
+from .tools.web import FetchWebPageTool, WebSearchTool
+from .tools.repomap_tool import RepomapTool
+from .ui import SessionView, StreamRenderer
 
 console = Console()
 error_console = Console(stderr=True)
@@ -48,6 +63,9 @@ SAFE_COMMANDS = {
 }
 
 
+# ----------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentux",
@@ -61,19 +79,34 @@ def build_parser() -> argparse.ArgumentParser:
             '  agentux "explain the architecture of this project"\n'
             '  agentux "fix the failing tests"\n'
             "  agentux --list-models\n"
+            "  agentux --list-tools\n"
             "  agentux --no-tools 'explain this shell script'\n"
+            "\n"
+            "In an interactive session (tab completes, / alone lists them):\n"
+            "  /help             every command\n"
+            "  /model            discover models; /model <name> switches\n"
+            "  /set              show settings; /set model x changes one\n"
+            "  /set save         keep preferences for next time\n"
+            "  /tools  /mcp      what is available\n"
+            "  /context          token and context usage\n"
+            "  /reset  /exit     clear the conversation, quit\n"
             "\n"
             "Ollama (local, no API key needed):\n"
             '  export AGENTUX_BASE_URL="http://localhost:11434/v1"\n'
-            '  export AGENTUX_MODEL="granite4.1:3b"\n'
+            '  export AGENTUX_MODEL="qwen3:14b"\n'
             "  agentux\n"
             "\n"
-            "Configuration (environment variables):\n"
+            "Configuration, highest precedence first:\n"
             "  AGENTUX_API_KEY   API key (required for remote providers)\n"
             "  AGENTUX_BASE_URL  API root (default: https://api.openai.com/v1)\n"
             "  AGENTUX_MODEL     Model name (default: gpt-4o-mini)\n"
             "  AGENTUX_MAX_STEPS Maximum agent iterations (default: 25)\n"
             "  AGENTUX_TIMEOUT   Request/command timeout in seconds (default: 120)\n"
+            "  then ~/.config/agentux/settings.json, written by '/set save'\n"
+            "\n"
+            "MCP servers are read from ~/.config/agentux/mcp.json and\n"
+            "<project>/.agentux/mcp.json. They are optional; Agentux works\n"
+            "with none configured. See README.md for the format.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -85,6 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--list-models",
         action="store_true",
         help="List the models the configured provider offers, then exit.",
+    )
+    parser.add_argument(
+        "--list-tools",
+        action="store_true",
+        help="List the built-in and MCP tools available, then exit.",
     )
     parser.add_argument("--model", help="Override AGENTUX_MODEL.")
     parser.add_argument(
@@ -98,6 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-steps", type=int, help="Maximum agent iterations before giving up."
     )
     parser.add_argument(
+        "--timeout", type=float, help="Shell command timeout in seconds (default: 120)."
+    )
+    parser.add_argument(
         "--no-tools", action="store_true", help="Disable all tools (plain conversation)."
     )
     parser.add_argument(
@@ -109,7 +150,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run destructive shell commands without asking. Use with care.",
     )
     parser.add_argument(
-        "--timeout", type=float, help="Shell command timeout in seconds (default: 120)."
+        "--no-mcp",
+        action="store_true",
+        help="Skip MCP servers entirely, even if configured.",
+    )
+    parser.add_argument(
+        "--no-lsp",
+        action="store_true",
+        help="Disable semantic code navigation tools (go_to_definition, find_references, get_symbol_info).",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Do not print the answer as it is generated (nicer for piping).",
+    )
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="Use the scrolling prompt instead of the full-screen interface.",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Show tool arguments in full."
@@ -117,14 +175,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--system-prompt", default=None, help="Override the built-in system prompt."
     )
+    parser.add_argument(
+        "-W", "--web", action="store_true", help="Launch embedded developer Web UI console."
+    )
+    parser.add_argument(
+        "--port", type=int, default=8080, help="Port for the embedded Web UI console (default: 8080)."
+    )
+    parser.add_argument(
+        "--open", action="store_true", help="Automatically open browser when Web UI starts."
+    )
+    parser.add_argument(
+        "--text-tools",
+        action="store_true",
+        default=False,
+        help="Enable text-based tool execution format for local models (e.g. qwen2.5-coder:3b).",
+    )
+    parser.add_argument(
+        "--lean",
+        action="store_true",
+        default=False,
+        help="Use a compact, lightweight system prompt (10x faster for local models like granite4.1:3b).",
+    )
+    parser.add_argument(
+        "--solo",
+        action="store_true",
+        default=False,
+        help=(
+            "Run Agentux Solo: qwen2.5:0.5b with a persistent memory it reads "
+            "every turn and writes when it learns."
+        ),
+    )
+    parser.add_argument(
+        "--solo-engine",
+        action="store_true",
+        default=False,
+        help=(
+            "Run Agentux Solo through the autonomous research engine. Solo "
+            "searches its knowledge database first, researches the web when it "
+            "does not know, stores what it learns, and verifies it was saved."
+        ),
+    )
     return parser
 
 
 def resolve_config(args: argparse.Namespace) -> Config:
     """Build the config, letting explicit flags win over the environment."""
-    # argparse handles --version/--help before we get here, so an API key is
-    # always required by the time this runs.
-    config = load_config()
+    # Solo runs against local Ollama, which needs no credential. The flag has
+    # to be honoured before the key check, which otherwise reads the configured
+    # base URL and demands a key for it.
+    solo = getattr(args, "solo", False)
+    config = load_config(require_api_key=not solo)
     if args.model:
         config.model = args.model
     if args.base_url:
@@ -137,34 +237,126 @@ def resolve_config(args: argparse.Namespace) -> Config:
         config.timeout = args.timeout
     if args.cwd:
         config.working_dir = os.path.abspath(os.path.expanduser(args.cwd))
+    if getattr(args, "text_tools", False):
+        config.allow_text_tools = True
+    if getattr(args, "lean", False):
+        config.lean = True
     return config.validate()
 
 
-def _shorten(text: str, limit: int) -> str:
-    text = text.strip()
+def _clip(text: str, limit: int) -> str:
+    """Truncate on a word boundary, with no marker left dangling."""
+    text = " ".join(text.split())
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n... [{len(text) - limit} more characters]"
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return cut + "…"
 
 
-def make_reporter(verbose: bool):
-    """Render agent activity to the terminal as it happens."""
+# ----------------------------------------------------------------------
+# Terminal presentation
+# ----------------------------------------------------------------------
+def make_reporter(view: SessionView, verbose: bool, status: Optional["StatusLine"] = None):
+    """Route agent events to the session view.
+
+    The status line is refreshed after each event so its tool count and token
+    total track the run instead of freezing at whatever they were when the
+    turn began.
+    """
 
     def report(kind: str, text: str) -> None:
         if kind == "tool_call":
-            console.print(f"  [dim]›[/dim] [bold cyan]{text}[/bold cyan]")
+            view.tool_call(text)
         elif kind == "tool_result":
             if text.startswith("ERROR:"):
-                console.print(
-                    f"  [red]✗[/red] [red]{_shorten(text, 400 if not verbose else 4000)}[/red]"
-                )
+                view.tool_error(text)
             else:
-                body = _shorten(text, 1200 if not verbose else 8000)
-                console.print(
-                    Panel(body, title="result", border_style="dim", padding=(0, 1))
-                )
+                view.tool_output(text, verbose)
+        elif kind == "narration":
+            view.narration(text)
+        elif kind == "reflection":
+            view.reflection(text)
+        if status is not None:
+            status.refresh()
 
     return report
+
+
+class AnswerStream:
+    """Owns the one live region the answer streams into.
+
+    Markdown cannot be appended to -- a half-typed code fence is not the same
+    document as a closed one -- so the accumulated text is re-rendered on every
+    delta.
+
+    The region is opened lazily, on the first delta, and the status line is
+    stopped immediately before that happens. Rich permits exactly one live
+    display at a time, and two of them do not merely overlap: the second
+    raises, and the run dies mid-answer. So the handover is explicit rather
+    than a matter of ordering luck.
+    """
+
+    def __init__(self, console: Console, enabled: bool) -> None:
+        self.console = console
+        self.enabled = enabled
+        self._renderer: Optional[StreamRenderer] = None
+        self._owned = False
+        self.text = ""
+        #: Called just before the live region opens, to release the terminal.
+        self.handover: Optional[Callable[[], None]] = None
+
+    @property
+    def active(self) -> bool:
+        """Whether the answer currently owns the terminal's live region."""
+        return self._owned
+
+    def start(self) -> None:
+        """Open the region eagerly. Used when the answer is already known."""
+        if not self.enabled or self._owned:
+            return
+        if self.handover is not None:
+            self.handover()
+        self.text = ""
+        self._renderer = StreamRenderer(self.console, markdown=True)
+        self._renderer.start()
+        self._owned = True
+
+    async def feed(self, piece: str) -> None:
+        if not self.enabled or not piece:
+            return
+        if not self._owned:
+            self.start()  # Lazy: the status line held the terminal until now.
+        self.text += piece
+        if self._renderer is not None:
+            self._renderer.feed(piece)
+
+    def stop(self) -> None:
+        if not self._owned or self._renderer is None:
+            self._owned = False
+            return
+        self.text = self._renderer.stop() or self.text
+        self._renderer = None
+        self._owned = False
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.stop()
+        self.enabled = enabled
+        if not enabled:
+            self.text = ""
+
+    def finish(self) -> str:
+        """Release the region and return the complete answer."""
+        self.stop()
+        return self.text
+
+
+def make_stream_printer(stream: AnswerStream):
+    """The ``on_text`` callback the agent streams answer deltas into."""
+
+    async def print_text(piece: str) -> None:
+        await stream.feed(piece)
+
+    return print_text
 
 
 def make_confirmer():
@@ -195,77 +387,6 @@ def make_confirmer():
     return confirm
 
 
-async def list_models(config: Config) -> int:
-    """Print the models the provider offers, flagging tool support."""
-    provider = OpenAICompatibleProvider(config)
-    lister = getattr(provider, "list_models_detailed", None)
-    try:
-        models = (
-            await lister() if callable(lister) else
-            [{"name": name} for name in await provider.list_models()]
-        )
-    except AgentuxError as exc:
-        explain_error(exc)
-        return 1
-
-    if not models:
-        console.print("[yellow]The provider returned no models.[/yellow]")
-        return 1
-
-    usable = [m for m in models if "tools" in (m.get("capabilities") or [])]
-    detail = bool(models and models[0].get("capabilities") is not None)
-
-    for model in sorted(models, key=lambda m: m["name"]):
-        caps = model.get("capabilities")
-        if detail:
-            can_tools = "tools" in (caps or [])
-            marker = "[green]✓ tools[/green]" if can_tools else "[red]✗ no tools[/red]"
-            thinking = " [dim](thinking)[/dim]" if "thinking" in (caps or []) else ""
-            console.print(f"  {model['name']:<40} {marker}{thinking}")
-        else:
-            console.print(f"  {model['name']}")
-
-    console.print(f"\n[dim]{len(models)} model(s) available.[/dim]")
-    if detail and usable:
-        console.print(
-            f"[dim]Models marked 'no tools' cannot run Agentux's tools; use "
-            f"--no-tools with those.[/dim]"
-        )
-    elif detail:
-        console.print(
-            "[yellow]None of these models report tool support. Agentux needs a "
-            "tool-capable model.[/yellow]"
-        )
-    return 0
-
-
-def build_agent(config: Config, args: argparse.Namespace) -> Agent:
-    """Wire up provider, tools, and agent. Kept separate so tests can call it."""
-    registry = ToolRegistry()
-    if not args.no_tools:
-        if args.allow_destructive:
-            registry.register(ShellTool(
-                cwd=config.working_dir, timeout=config.timeout, allow_destructive=True
-            ))
-        else:
-            registry.register(ShellTool(
-                cwd=config.working_dir,
-                timeout=config.timeout,
-                confirm=make_confirmer(),
-            ))
-        registry.register(FilesystemTool(root=config.working_dir, read_only=args.read_only))
-        registry.register(ProjectTool(root=config.working_dir))
-
-    provider = OpenAICompatibleProvider(config)
-    return Agent(
-        config=config,
-        provider=provider,
-        registry=registry,
-        system_prompt=args.system_prompt,
-        on_event=make_reporter(args.verbose),
-    )
-
-
 def print_answer(answer: str) -> None:
     """Render the final response as markdown when it looks like markdown."""
     if any(marker in answer for marker in ("```", "\n- ", "\n#", "**")):
@@ -276,6 +397,206 @@ def print_answer(answer: str) -> None:
         console.print(answer)
 
 
+# ----------------------------------------------------------------------
+# Discovery commands
+# ----------------------------------------------------------------------
+async def list_models(config: Config) -> int:
+    """Print the models the provider offers, flagging tool support."""
+    models, error = await discover_models(config)
+    if error is not None:
+        explain_error(error)
+        return 1
+    if not models:
+        console.print("[yellow]The provider returned no models.[/yellow]")
+        return 1
+    render_model_table(console, models, current=None)
+    return 0
+
+
+async def list_tools(config: Config, args: argparse.Namespace) -> int:
+    """Print every tool the agent could call, built-in and MCP."""
+    from .tools.mcp_tool import MCPToolManager
+
+    registry = ToolRegistry()
+    if not args.no_tools:
+        _register_builtin_tools(registry, config, args)
+
+    manager: Optional[MCPToolManager] = None
+    if not args.no_tools and not args.no_mcp:
+        manager = MCPToolManager(
+            working_dir=config.working_dir,
+            on_log=lambda message: console.print(f"[dim]{message}[/dim]"),
+        )
+        try:
+            await manager.load()
+            for tool in manager.tools:
+                registry.register(tool)
+        finally:
+            await manager.close()
+
+    table = Table(box=None, pad_edge=False, show_header=True, header_style="dim")
+    table.add_column("tool", style="bold cyan", no_wrap=True)
+    table.add_column("source", style="magenta", no_wrap=True)
+    table.add_column("description", style="", overflow="fold")
+
+    for name in registry.names:
+        tool = registry.get(name)
+        source = "MCP" if name.startswith("mcp__") else "built-in"
+        first = tool.description.strip().split("\n")[0]
+        table.add_row(name, source, _clip(first, 120))
+
+    console.print()
+    console.print(table)
+
+    if manager and manager.warnings:
+        console.print()
+        for warning in manager.warnings:
+            console.print(f"[yellow]![/yellow] {warning}")
+
+    console.print()
+    console.print(
+        f"[dim]{len(registry)} tool(s) · config: "
+        f"{global_config_path()} and {project_config_path(config.working_dir)}[/dim]"
+    )
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Agent construction
+# ----------------------------------------------------------------------
+def _register_builtin_tools(
+    registry: ToolRegistry, config: Config, args, confirm=None
+) -> None:
+    if getattr(args, "allow_destructive", False):
+        registry.register(ShellTool(
+            cwd=config.working_dir, timeout=config.timeout, allow_destructive=True
+        ))
+    else:
+        registry.register(ShellTool(
+            cwd=config.working_dir,
+            timeout=config.timeout,
+            confirm=confirm if confirm is not None else make_confirmer(),
+        ))
+    registry.register(FilesystemTool(root=config.working_dir, read_only=args.read_only))
+    registry.register(ProjectTool(root=config.working_dir))
+    registry.register(SearchTool(root=config.working_dir))
+    registry.register(OutlineSymbolsTool(root=config.working_dir))
+    registry.register(GitTool(root=config.working_dir, timeout=config.timeout))
+    registry.register(TodoTool())
+    registry.register(ViewImageTool(root=config.working_dir))
+    registry.register(WebSearchTool())
+    registry.register(FetchWebPageTool())
+    registry.register(RepomapTool(root=config.working_dir))
+
+    # Semantic code navigation via LSP (gopls, pyright, rust-analyzer, ...)
+    if not getattr(args, "no_lsp", False):
+        from .tools.lsp import (
+            FindReferencesTool,
+            GetSymbolInfoTool,
+            GoToDefinitionTool,
+        )
+        registry.register(GoToDefinitionTool(root=config.working_dir))
+        registry.register(FindReferencesTool(root=config.working_dir))
+        registry.register(GetSymbolInfoTool(root=config.working_dir))
+
+
+def build_registry(config: Config, args: argparse.Namespace, mcp_manager=None,
+                   confirm=None) -> ToolRegistry:
+    """Build the tool registry for a session.
+
+    Separate from :func:`build_agent` so ``/set cwd`` can re-root the tools
+    without rebuilding the provider or losing the conversation.
+    """
+    registry = ToolRegistry()
+    if getattr(args, "no_tools", False):
+        return registry
+    _register_builtin_tools(registry, config, args, confirm=confirm)
+    if mcp_manager is not None:
+        for tool in mcp_manager.tools:
+            registry.register(tool)
+    return registry
+
+
+def enable_solo(agent, config: Config, allow_tools: bool = True) -> None:
+    """Apply the Agentux Solo preset to an agent that has already been built.
+
+    Called from :func:`build_agent` when ``--solo`` is passed, so every run
+    mode (prompt, interactive, TUI, web) gets the same treatment.
+    """
+    from .solo import apply_solo, solo_preset
+
+    apply_solo(agent, solo_preset(config.working_dir))
+    if not allow_tools:
+        # '--no-tools --solo' means what it says: the memory still works
+        # through automatic recall, but the model gets no explicit tools.
+        for name in ("memory_save", "memory_search"):
+            agent.registry.deregister(name)
+
+
+def build_agent(
+    config: Config,
+    args: argparse.Namespace,
+    mcp_manager=None,
+    stream: Optional[AnswerStream] = None,
+    view: Optional[SessionView] = None,
+) -> Agent:
+    """Wire up provider, tools, and agent. Kept separate so tests can call it."""
+    registry = build_registry(config, args, mcp_manager)
+    provider = OpenAICompatibleProvider(config)
+
+    if stream is None:
+        stream = AnswerStream(console, enabled=False)
+    if view is None:
+        view = SessionView(console, None, mcp_manager)
+
+    agent = Agent(
+        config=config,
+        provider=provider,
+        registry=registry,
+        system_prompt=args.system_prompt,
+        on_event=make_reporter(view, args.verbose),
+        on_text=make_stream_printer(stream),
+        context_manager=ContextManager(),
+    )
+    if getattr(args, "solo", False):
+        enable_solo(agent, config, allow_tools=not getattr(args, "no_tools", False))
+    return agent
+
+
+async def attach_mcp(config: Config, args: argparse.Namespace):
+    """Start the configured MCP servers, tolerating any that fail.
+
+    Returns ``(manager, warnings)``. The manager may hold no working servers at
+    all -- Agentux is fully functional on its built-in tools.
+    """
+    from .tools.mcp_tool import MCPToolManager
+
+    manager = MCPToolManager(
+        working_dir=config.working_dir,
+        timeout=60.0,
+        on_log=lambda message: console.print(f"  [dim]{message}[/dim]"),
+    )
+
+    if args.no_tools or args.no_mcp:
+        return manager, []
+
+    if not manager.configs and not os.path.isfile(global_config_path()):
+        # Nothing configured anywhere: do not pay for two failed file reads
+        # on every single invocation.
+        return manager, []
+
+    try:
+        await manager.load()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        manager.warnings.append(f"MCP could not be started: {exc}")
+    return manager, manager.warnings
+
+
+# ----------------------------------------------------------------------
+# Errors
+# ----------------------------------------------------------------------
 def explain_error(exc: BaseException) -> None:
     """Print an actionable error message."""
     if isinstance(exc, AuthenticationError):
@@ -298,76 +619,439 @@ def explain_error(exc: BaseException) -> None:
         error_console.print(f"[bold red]Unexpected error[/bold red]\n{type(exc).__name__}: {exc}")
 
 
-async def run_once(agent: Agent, prompt: str) -> int:
-    """Run a single request. Returns a process exit code."""
+# ----------------------------------------------------------------------
+# Run modes
+# ----------------------------------------------------------------------
+#: The prompt marker. A character, not an ASCII arrow, so it survives a font
+#: that lacks the box-drawing glyphs.
+PROMPT_MARK = "❯"
+
+
+class StatusLine:
+    """The one-line live status shown while the agent works.
+
+    It has to hand the terminal over the moment the answer starts streaming,
+    because two live regions on one terminal fight each other and the loser
+    leaves a corrupted line behind. That handover is the whole reason this is
+    a class and not a ``console.status`` context manager.
+    """
+
+    def __init__(self, view: SessionView, target: Console, enabled: bool = True) -> None:
+        self.view = view
+        self.console = target
+        self.enabled = enabled and target.is_terminal
+        self._live = None
+
+    def start(self) -> None:
+        if not self.enabled or self._live is not None:
+            return
+        from rich.live import Live
+
+        # get_renderable, not a pre-rendered string: the elapsed time, the
+        # tool count and the token total all change while this is up, and a
+        # string captured at start would repaint the same stale line forever.
+        self._live = Live(
+            console=self.console,
+            refresh_per_second=8,
+            transient=True,
+            get_renderable=self.view.status,
+        )
+        self._live.start()
+
+    def refresh(self) -> None:
+        if self._live is not None:
+            self._live.update(self.view.status())
+
+    def stop(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    @property
+    def active(self) -> bool:
+        return self._live is not None
+
+
+def _make_usage_recorder(view: SessionView, agent: Agent):
+    """A callback that keeps the session's token totals honest.
+
+    Providers that report nothing still cost tokens, so an estimate is
+    recorded too -- and the display is left saying which it is showing.
+    """
+    from .usage import estimate_tokens
+
+    def record(usage: Optional[dict]) -> None:
+        if usage:
+            view.usage.record(usage)
+            return
+        # No numbers from the provider: fall back to a size-based estimate so
+        # the counter still moves, and leave `reported` False so the UI marks
+        # the figure as guessed rather than billed.
+        prompt = sum(estimate_tokens(m.content) for m in agent.history)
+        view.usage.record(None, fallback_prompt=prompt)
+
+    return record
+
+
+async def _run_turn(
+    agent: Agent,
+    prompt: str,
+    view: SessionView,
+    stream: "AnswerStream",
+    status: StatusLine,
+    verbose: bool = False,
+    echo_prompt: bool = True,
+) -> int:
+    """Run one request with live output. Returns a process exit code."""
+    if echo_prompt:
+        console.print()
+        console.print(f"[bold green]{PROMPT_MARK}[/bold green] {prompt.strip()[:200]}")
+        console.print()
+
+    # The status line owns the terminal for now. The answer takes it over
+    # lazily, on the first delta, via the handover below.
+    stream.handover = status.stop
+    agent.on_event = make_reporter(view, verbose, status)
+    status.start()
+
     try:
-        with console.status("[bold blue]thinking...", spinner="dots"):
-            answer = await agent.run(prompt)
-    except AgentuxError as exc:
-        explain_error(exc)
-        return 1
+        answer = await agent.run(prompt, interactive=True)
+    except UserAbort:
+        status.stop()
+        stream.stop()
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        return 130
     except KeyboardInterrupt:
+        status.stop()
+        stream.stop()
         console.print("\n[dim]Interrupted.[/dim]")
         return 130
+    except AgentuxError as exc:
+        status.stop()
+        stream.stop()
+        explain_error(exc)
+        return 1
     except Exception as exc:
+        status.stop()
+        stream.stop()
         # A bug in Agentux should read as a message, not a traceback dump.
         explain_error(exc)
         return 1
-    print_answer(answer)
+    else:
+        # The status goes first: it is transient, and leaving it up would
+        # overwrite the answer that just streamed into the region above it.
+        status.stop()
+        streamed = stream.finish()
+        # Only print what was not already shown live. Printing the answer
+        # twice is the single most obvious way to look broken.
+        if not agent.answer_streamed or not streamed:
+            console.print()
+            print_answer(answer)
+        view.summary(agent.last_steps)
+        return 0
+
+
+async def run_once(
+    agent: Agent,
+    prompt: str,
+    view: Optional[SessionView] = None,
+    stream: Optional["AnswerStream"] = None,
+) -> int:
+    """Run a single request. Returns a process exit code."""
+    if view is None:
+        view = SessionView(console, agent)
+    if stream is None:
+        stream = AnswerStream(console, enabled=False)
+
+    agent.on_usage = _make_usage_recorder(view, agent)
+    agent.on_text = make_stream_printer(stream)
+
+    status = StatusLine(view, console, enabled=stream.enabled)
+    return await _run_turn(
+        agent, prompt, view, stream, status, echo_prompt=stream.enabled
+    )
+
+
+async def run_tui(
+    agent: Agent,
+    mcp_manager=None,
+    args: Optional[argparse.Namespace] = None,
+    console: Optional[Console] = None,
+) -> int:
+    """Run the full-screen terminal interface.
+
+    The state built here -- the view, the usage recorder, the command context
+    and the tool rebuilder -- is the same set :func:`run_interactive` builds.
+    The two differ only in how a turn is presented: there, output scrolls into
+    the terminal behind a status line; here it is rendered into the transcript
+    and redrawn in place.
+
+    The agent's callbacks are pointed at the TUI rather than at a ``Stream``,
+    because in a full-screen application there is no live region to hand over.
+    One application owns every part of the screen, so nothing has to take the
+    terminal from anything else -- which is what the two-``Live`` crash in the
+    scrolling REPL came from.
+    """
+    from . import commands
+    from .tui import Tui, _CaptureConsole
+
+    target = console if console is not None else globals()["console"]
+    view = SessionView(target, agent, mcp_manager)
+    agent.on_usage = _make_usage_recorder(view, agent)
+
+    if args is None:
+        args = build_parser().parse_args([])
+    session: Dict[str, Any] = {"stream": True, "verbose": args.verbose}
+
+    def rebuild_tools():
+        return build_registry(agent.config, args, mcp_manager, confirm=make_confirmer())
+
+    # Commands write to ``context.console``. In the full-screen app that has to
+    # be a capture, not stdout -- the application owns the terminal, and a
+    # handler printing to it would land behind the UI and be invisible.
+    capture = _CaptureConsole()
+    context = commands.CommandContext(
+        agent=agent,
+        view=view,
+        mcp_manager=mcp_manager,
+        console=capture.console,
+        args=args,
+        session=session,
+        rebuild_tools=rebuild_tools,
+    )
+
+    tui = Tui(agent, view, context, args, mcp_manager=mcp_manager)
+    agent.tui = tui  # So /mode and other commands can reach the TUI
+    tui.adopt_capture(capture)
+
+    async def run_turn(prompt: str) -> None:
+        """One turn, rendered into the transcript instead of the terminal."""
+        tui.begin_answer()
+        agent.on_event = _tui_reporter(tui, view, bool(session.get("verbose", False)))
+        agent.on_text = _tui_printer(tui)
+
+        try:
+            answer = await agent.run(prompt, interactive=True)
+        finally:
+            tui.end_answer()
+
+        # ``agent.answer_streamed`` reports whether a *callback* was installed,
+        # not whether anything came through it -- a provider that returns the
+        # whole answer in one non-streaming response sends no deltas, and
+        # trusting that flag silently drops the answer off the screen.
+        if answer and not tui.answer_streamed:
+            tui.add_answer(answer)
+
+    tui.run_turn = run_turn
+
+    for warning in (mcp_manager.warnings if mcp_manager else []):
+        tui.transcript.add_text(f"! {warning}", "warn")
+
+    await tui.run_async()
     return 0
 
 
-async def run_interactive(agent: Agent) -> int:
+def _tui_reporter(tui, view: SessionView, verbose: bool):
+    """``on_event`` for the TUI: writes into the transcript, refreshes chrome."""
+    from .ui import render_tool_ansi
+
+    def report(kind: str, text: str) -> None:
+        if kind == "tool_call":
+            name = text.split("(", 1)[0]
+            arguments = text[len(name):]
+            tui.add_tool(name, arguments)
+        elif kind == "tool_result":
+            if text.startswith("ERROR:"):
+                tui.add_text(_clip(text, 400), "error")
+            elif verbose:
+                tui.add_ansi(render_tool_ansi(text))
+        elif kind == "narration":
+            tui.add_text(_clip(text, 300), "footer")
+        elif kind == "reflection":
+            tui.add_text("⟳ " + _clip(text, 200), "warn")
+        tui.note_tool()
+
+    return report
+
+
+def _tui_printer(tui):
+    """``on_text``: feed the streaming answer into the transcript."""
+
+    async def print_text(piece: str) -> None:
+        tui.feed_answer(piece)
+
+    return print_text
+
+
+async def run_interactive(
+    agent: Agent,
+    mcp_manager=None,
+    stream: Optional["AnswerStream"] = None,
+    args: Optional[argparse.Namespace] = None,
+) -> int:
     """Run a REPL, keeping history across turns."""
-    console.print(
-        Panel(
-            f"[bold blue]Agentux {__version__}[/bold blue]\n"
-            f"Model: [cyan]{agent.provider.get_model_name()}[/cyan]  |  "
-            f"Workspace: [cyan]{agent.config.working_dir}[/cyan]\n"
-            f"Tools: [cyan]{', '.join(agent.registry.names) or 'none'}[/cyan]\n\n"
-            "[dim]/exit to quit, /reset to clear history, /tools to list tools[/dim]",
-            border_style="blue",
-        )
+    from . import commands
+
+    if stream is None:
+        stream = AnswerStream(console, enabled=False)
+    if args is None:
+        args = build_parser().parse_args([])
+
+    view = SessionView(console, agent, mcp_manager)
+    agent.on_usage = _make_usage_recorder(view, agent)
+    agent.on_text = make_stream_printer(stream)
+
+    # Runtime toggles that are not on Config. /set writes them, the loop reads
+    # them, and nothing persists them -- they describe this session only.
+    session: Dict[str, Any] = {"stream": stream.enabled, "verbose": args.verbose}
+
+    def rebuild_tools() -> ToolRegistry:
+        """Re-root the tools after ``/set cwd``, keeping the MCP ones."""
+        return build_registry(agent.config, args, mcp_manager, confirm=make_confirmer())
+
+    context = commands.CommandContext(
+        agent=agent,
+        view=view,
+        mcp_manager=mcp_manager,
+        console=console,
+        args=args,
+        session=session,
+        rebuild_tools=rebuild_tools,
     )
+
+    view.banner()
+    if mcp_manager and mcp_manager.warnings:
+        for warning in mcp_manager.warnings:
+            console.print(f"[yellow]![/yellow] {warning}")
 
     while True:
         try:
-            user_input = console.input("\n[bold green]❯[/bold green] ").strip()
+            user_input = await read_input(console, commands)
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Bye.[/dim]")
             return 0
 
         if not user_input:
             continue
-        if user_input in ("/exit", "/quit"):
-            return 0
-        if user_input == "/reset":
-            agent.reset()
-            console.print("[dim]Conversation cleared.[/dim]")
-            continue
-        if user_input == "/tools":
-            console.print(
-                "[dim]Tools:[/dim] "
-                + (", ".join(agent.registry.names) or "none")
-            )
+
+        # A slash command is a request to Agentux, not to the model. Nothing
+        # typed after a leading slash ever reaches the provider.
+        if user_input.startswith("/"):
+            keep_going = await dispatch_command(context, user_input)
+            if not keep_going:
+                return 0
             continue
 
-        try:
-            with console.status("[bold blue]thinking...", spinner="dots"):
-                answer = await agent.run(user_input, interactive=True)
-            print_answer(answer)
-        except UserAbort:
-            console.print("[yellow]Interrupted.[/yellow]")
-        except AgentuxError as exc:
-            explain_error(exc)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted.[/yellow]")
-        except Exception as exc:
-            # Keep the session alive rather than dropping the user into a
-            # traceback and losing their conversation.
-            explain_error(exc)
+        # /set may have changed either of these since the last turn, so they
+        # are read fresh every time rather than captured at startup.
+        stream.set_enabled(bool(session.get("stream", stream.enabled)))
+        status = StatusLine(view, console, enabled=stream.enabled)
+        await _run_turn(
+            agent,
+            user_input,
+            view,
+            stream,
+            status,
+            verbose=bool(session.get("verbose", args.verbose)),
+            echo_prompt=stream.enabled,
+        )
 
 
+async def read_input(console: Console, commands_module) -> str:
+    """Read one line, with tab-completion for slash commands.
+
+    Falls back to a plain prompt whenever the terminal cannot support a real
+    readline editor -- a pipe, a dumb terminal, no prompt_toolkit -- so the
+    REPL still works everywhere. Completion is a nicety; it must never be the
+    reason the REPL stops working.
+    """
+    plain = f"\n[bold green]{PROMPT_MARK}[/bold green] "
+
+    try:
+        from prompt_toolkit import HTML, PromptSession
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.history import InMemoryHistory
+    except Exception:
+        return console.input(plain).strip()
+
+    class _SlashCompleter(Completer):
+        """Completes command names and aliases, and nothing else.
+
+        A bare ``/`` should not turn every word in the session into a
+        suggestion, so completion is limited to text that starts with a slash.
+        """
+
+        def get_completions(inner_self, document, complete_event):  # noqa: N805
+            text = document.text_before_cursor
+            if not text.startswith("/"):
+                return
+            prefix = text[1:].split(" ")[0]
+            start = -len(prefix)
+            for name in commands_module.names():
+                if name.startswith(prefix):
+                    yield Completion("/" + name, start_position=start)
+            for alias, target in commands_module.ALIASES.items():
+                if alias.startswith(prefix):
+                    yield Completion(
+                        "/" + alias, start_position=start, display_meta=f"= /{target}"
+                    )
+
+    try:
+        session = PromptSession(history=InMemoryHistory(), completer=_SlashCompleter())
+        return session.prompt(
+            HTML("<ansigreen><b>❯ </b></ansigreen>"), complete_while_typing=True
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except Exception:
+        return console.input(plain).strip()
+
+
+async def dispatch_command(context, text: str) -> bool:
+    """Run one slash command. Returns ``False`` to end the session.
+
+    An unknown ``/foo`` is reported rather than guessed at, and never silently
+    forwarded to the model: a user who typed a slash expects a command, and
+    sending it as a prompt produces a baffling answer about a slash.
+    """
+    from . import commands
+
+    stripped = text.strip()
+    if stripped == "/":
+        # A bare slash is a request for the menu, not for the model.
+        await commands.cmd_help(context, "")
+        return True
+
+    command = commands.resolve(stripped)
+    if command is None:
+        name = stripped.split()[0]
+        console.print(
+            f"[yellow]No command named {name!r}. Try[/yellow] [bold]/help[/bold]"
+            f"[yellow], or drop the slash to talk to the agent.[/yellow]"
+        )
+        return True
+
+    # Everything after the first word is the argument, whatever spelling of the
+    # command was typed: "/model x", "/models x" and "/MODEL x" all pass "x".
+    argument = " ".join(stripped.split()[1:]).strip()
+
+    try:
+        return await command.handler(context, argument)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Interrupted.[/dim]")
+        return True
+    except AgentuxError as exc:
+        explain_error(exc)
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        # A broken command must not end the session or lose the conversation.
+        explain_error(exc)
+        return True
+
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for the ``agentux`` command."""
     parser = build_parser()
@@ -382,16 +1066,58 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list_models:
         return asyncio.run(list_models(config))
 
-    try:
-        agent = build_agent(config, args)
-    except AgentuxError as exc:
-        explain_error(exc)
-        return 1
+    if args.list_tools:
+        return asyncio.run(list_tools(config, args))
+
+    # Streaming needs a terminal to stream into. Piped output gets the whole
+    # answer at once, which is what a file or a pipe actually wants.
+    enabled = console.is_terminal and not args.no_stream
+    stream = AnswerStream(console, enabled=enabled)
 
     try:
-        if args.prompt:
-            return asyncio.run(run_once(agent, args.prompt))
-        return asyncio.run(run_interactive(agent))
+        manager, warnings = asyncio.run(attach_mcp(config, args))
+        try:
+            if getattr(args, "web", False):
+                from .web import WebServer
+                agent = build_agent(config, args, mcp_manager=manager, stream=stream)
+                web_server = WebServer(agent, config, port=getattr(args, "port", 8080))
+                web_server.start(open_browser=getattr(args, "open", False))
+                console.print(f"\n  [bold #00ff88]⏣ AGENTUX · Web Console[/bold #00ff88]\n")
+                console.print(f"  • Local URL:      [bold cyan]{web_server.url}[/bold cyan]")
+                console.print(f"  • Workspace:      {config.working_dir}")
+                console.print(f"  • Active Model:   {config.model}\n")
+                console.print("  [dim]Press Ctrl+C to terminate web server.[/dim]\n")
+                try:
+                    import time
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    web_server.stop()
+                    console.print("\n[dim]Shut down Agentux web server.[/dim]")
+                    return 0
+
+            if args.prompt:
+                if getattr(args, "solo_engine", False):
+                    return asyncio.run(
+                        run_solo_engine(config, args, args.prompt, console=console)
+                    )
+                view = SessionView(console, None, manager)
+                agent = build_agent(config, args, mcp_manager=manager, stream=stream, view=view)
+                view.agent = agent  # the view needs the agent it is describing
+                for warning in warnings:
+                    console.print(f"[yellow]![/yellow] {warning}")
+                return asyncio.run(run_once(agent, args.prompt, view=view, stream=stream))
+
+            agent = build_agent(config, args, mcp_manager=manager, stream=stream)
+            if console.is_terminal and not getattr(args, "no_tui", False):
+                return asyncio.run(
+                    run_tui(agent, mcp_manager=manager, args=args, console=console)
+                )
+            return asyncio.run(
+                run_interactive(agent, mcp_manager=manager, stream=stream, args=args)
+            )
+        finally:
+            asyncio.run(manager.close())
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted.[/dim]")
         return 130
@@ -400,6 +1126,78 @@ def main(argv: Optional[List[str]] = None) -> int:
 def cli() -> None:
     """Console-script wrapper that propagates the exit code."""
     sys.exit(main())
+
+
+def solo_main(argv: Optional[List[str]] = None) -> int:
+    """Entry point for ``agentux-solo``: Agentux Solo, with no extra flags."""
+    return main(["--solo", *(argv or [])])
+
+
+async def run_solo_engine(
+    config: Config,
+    args: argparse.Namespace,
+    prompt: str,
+    *,
+    console=None,
+) -> int:
+    """Run a prompt through the autonomous Agentux Solo research engine.
+
+    The engine enforces the research cycle deterministically rather than
+    trusting the model to remember to look things up. It prints each step as
+    it happens so the user can see whether Solo is searching memory, doing
+    web research, or saving what it learned.
+    """
+    from .knowledge import KnowledgeStore
+    from .providers.openai_compatible import OpenAICompatibleProvider
+    from .solo import solo_preset
+    from .solo_engine import SoloEngine
+
+    if console is None:
+        console = globals().get("console") or Console()
+
+    preset = solo_preset(config.working_dir)
+    config.model = preset.model
+    config.base_url = preset.base_url
+    provider = OpenAICompatibleProvider(config)
+    knowledge = KnowledgeStore(path=preset.memory_path)
+
+    engine = SoloEngine(
+        provider,
+        knowledge,
+        system_prompt=preset.system_prompt,
+        project=config.working_dir,
+    )
+
+    def on_event(event):
+        kind = event.kind
+        msg = event.message
+        if kind == "start":
+            console.print(f"[bold #00ff88]⌋ Solo[/bold #00ff88] {msg}")
+        elif kind == "memory_search":
+            console.print(f"[dim]⌋ memory search[/dim] {msg}")
+        elif kind == "memory_hit":
+            console.print(f"[bold cyan]⌋ remembered[/bold cyan] {msg}")
+        elif kind == "memory_miss":
+            console.print(f"[dim]⌋ nothing remembered[/dim] {msg}")
+        elif kind == "tool_call":
+            console.print(f"[bold yellow]⌋ tool[/bold yellow] {msg}")
+        elif kind == "tool_result":
+            console.print(f"[dim]   ↳ {msg}[/dim]")
+        elif kind == "nudge":
+            console.print(f"[bold magenta]⌋ enforced[/bold magenta] {msg}")
+        elif kind == "answer":
+            console.print(f"\n[bold #00ff88]{msg}[/bold #00ff88]")
+        elif kind == "done":
+            console.print(f"[dim]⌋ {msg}[/dim]")
+        elif kind == "error":
+            console.print(f"[bold red]⌋ error[/bold red] {msg}")
+        elif kind == "warning":
+            console.print(f"[bold yellow]⌋ warning[/bold yellow] {msg}")
+
+    console.print(f"[bold #00ff88]⌋ Agentux Solo engine[/bold #00ff88]  model={config.model}")
+    result = await engine.run(prompt, on_event=on_event)
+    knowledge.close()
+    return 0 if result.answer else 1
 
 
 if __name__ == "__main__":
