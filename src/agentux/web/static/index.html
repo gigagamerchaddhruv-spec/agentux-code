@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="emerald">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentux · Web Console</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⌋</text></svg>" />
+</head>
+<body>
+  <div class="app">
+    <!-- ────────────────────────── Sidebar ────────────────────────── -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">⌋</span>
+        <div class="brand-text">
+          <strong>AGENTUX</strong>
+          <span id="model-line" class="muted">—</span>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <button class="nav-item active" data-view="chat">
+          <span class="nav-icon">💬</span> Chat
+        </button>
+        <button class="nav-item" data-view="files">
+          <span class="nav-icon">🗂</span> Workspace
+        </button>
+        <button class="nav-item" data-view="tools">
+          <span class="nav-icon">🔧</span> Tools
+        </button>
+        <button class="nav-item" data-view="checkpoints">
+          <span class="nav-icon">Snapshots</span> Checkpoints
+        </button>
+        <button class="nav-item" data-view="sessions">
+          <span class="nav-icon">🧾</span> Sessions
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span id="workspace-line" class="muted">—</span>
+      </div>
+    </aside>
+
+    <!-- ────────────────────────── Main ────────────────────────── -->
+    <main class="main">
+      <header class="topbar">
+        <div class="view-title">
+          <h1 id="view-title">Chat</h1>
+          <p id="view-subtitle" class="muted">Ask anything. Tools run inline.</p>
+        </div>
+        <div class="topbar-actions">
+          <button id="clear-btn" class="btn btn-ghost" title="Clear conversation">Clear</button>
+        </div>
+      </header>
+
+      <!-- Chat view -->
+      <section class="view chat-view" id="view-chat">
+        <div class="messages" id="messages"></div>
+        <form class="composer" id="composer">
+          <textarea id="input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>
+          <button type="submit" id="send-btn" class="btn btn-primary">Send</button>
+        </form>
+      </section>
+
+      <!-- Files view -->
+      <section class="view" id="view-files" hidden>
+        <div class="file-browser">
+          <div class="file-tree" id="file-tree"></div>
+          <div class="file-viewer">
+            <div class="file-viewer-head">
+              <span id="file-path" class="muted">No file selected</span>
+              <button id="close-file-btn" class="btn btn-ghost btn-sm">✕</button>
+            </div>
+            <pre id="file-content" class="file-content"></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tools view -->
+      <section class="view" id="view-tools" hidden>
+        <div class="tools-grid" id="tools-grid"></div>
+      </section>
+
+      <!-- Checkpoints view -->
+      <section class="view" id="view-checkpoints" hidden>
+        <div class="checkpoints" id="checkpoints"></div>
+      </section>
+
+      <!-- Sessions view -->
+      <section class="view" id="view-sessions" hidden>
+        <div class="sessions" id="sessions"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
