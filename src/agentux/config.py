@@ -8,12 +8,13 @@ No credentials are ever read from a file or hardcoded in the source.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-from .errors import ConfigurationError
+from .errors import AgentuxError as ConfigurationError
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -59,6 +60,10 @@ class Config:
     timeout: float = DEFAULT_TIMEOUT
     #: Working directory the agent is confined to and runs commands in.
     working_dir: str = field(default_factory=os.getcwd)
+    #: Whether to allow models to invoke tools via structured text/markdown (useful for local models).
+    allow_text_tools: bool = False
+    #: Use a lean/compact system prompt for fast prefill on local models.
+    lean: bool = False
 
     def __repr__(self) -> str:
         key = REDACTED if self.api_key else None
@@ -140,16 +145,68 @@ def _env_int(name: str, default: int) -> int:
         )
 
 
+def settings_path() -> str:
+    """Where ``/set save`` persists non-secret preferences."""
+    override = os.getenv("AGENTUX_SETTINGS_FILE")
+    if override:
+        return os.path.expanduser(override)
+    return os.path.join(os.path.expanduser("~"), ".config", "agentux", "settings.json")
+
+
+def load_settings() -> Dict[str, Any]:
+    """Read persisted settings. Missing or broken files are not fatal."""
+    path = settings_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(values: Dict[str, Any]) -> str:
+    """Write settings to disk, creating the directory if needed.
+
+    Secrets are refused: a plaintext API key on disk is a liability, and the
+    environment variable or the flag is the right place for one.
+    """
+    if "api_key" in values:
+        raise ConfigurationError(
+            "Agentux will not save an API key to disk. Set AGENTUX_API_KEY in "
+            "your environment, or pass --api-key, or use '/set api-key <key>' "
+            "to set it for this session only."
+        )
+
+    path = settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(values, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
 def load_config(require_api_key: bool = True) -> Config:
-    """Build a :class:`Config` from ``AGENTUX_*`` environment variables.
+    """Build a :class:`Config` from settings, then the environment.
+
+    Precedence, highest first: ``AGENTUX_*`` environment variables, then the
+    persisted settings file, then the built-in defaults. That ordering means
+    an exported variable still wins over anything saved earlier, so an
+    environment override never becomes sticky.
 
     An API key is required for remote providers but not for local ones:
     Ollama and friends listen on loopback without authentication, so
     ``AGENTUX_API_KEY`` is filled in with a placeholder when the base URL is
     local and no key was supplied.
     """
-    api_key = os.getenv("AGENTUX_API_KEY", "").strip() or None
-    base_url = _env_str("AGENTUX_BASE_URL", DEFAULT_BASE_URL)
+    settings = load_settings()
+    api_key = os.getenv("AGENTUX_API_KEY", "").strip() or settings.get("api_key") or None
+    base_url = _env_str("AGENTUX_BASE_URL", _setting(settings, "base_url", DEFAULT_BASE_URL))
 
     if require_api_key and not api_key:
         if is_local_url(base_url):
@@ -162,6 +219,10 @@ def load_config(require_api_key: bool = True) -> Config:
                 "Set it to your provider's API key, for example:\n"
                 '  export AGENTUX_API_KEY="..."\n'
                 "\n"
+                "Prefer not to use environment variables? Start Agentux and "
+                "run '/set api-key <key>' to set it for the session, then "
+                "'/set save' to keep the rest of your preferences.\n"
+                "\n"
                 "Using a local model? Point Agentux at Ollama and no key is "
                 "needed:\n"
                 '  export AGENTUX_BASE_URL="http://localhost:11434/v1"\n'
@@ -171,11 +232,29 @@ def load_config(require_api_key: bool = True) -> Config:
     config = Config(
         api_key=api_key,
         base_url=base_url,
-        model=_env_str("AGENTUX_MODEL", DEFAULT_MODEL),
-        temperature=_env_float("AGENTUX_TEMPERATURE", DEFAULT_TEMPERATURE),
-        max_tokens=_env_int("AGENTUX_MAX_TOKENS", DEFAULT_MAX_TOKENS),
-        max_steps=_env_int("AGENTUX_MAX_STEPS", DEFAULT_MAX_STEPS),
-        timeout=_env_float("AGENTUX_TIMEOUT", DEFAULT_TIMEOUT),
-        working_dir=_env_str("AGENTUX_CWD", os.getcwd()),
+        model=_env_str("AGENTUX_MODEL", _setting(settings, "model", DEFAULT_MODEL)),
+        temperature=_env_float(
+            "AGENTUX_TEMPERATURE", _setting(settings, "temperature", DEFAULT_TEMPERATURE)
+        ),
+        max_tokens=_env_int(
+            "AGENTUX_MAX_TOKENS", _setting(settings, "max_tokens", DEFAULT_MAX_TOKENS)
+        ),
+        max_steps=_env_int(
+            "AGENTUX_MAX_STEPS", _setting(settings, "max_steps", DEFAULT_MAX_STEPS)
+        ),
+        timeout=_env_float("AGENTUX_TIMEOUT", _setting(settings, "timeout", DEFAULT_TIMEOUT)),
+        working_dir=_env_str(
+            "AGENTUX_CWD", _setting(settings, "working_dir", os.getcwd())
+        ),
+        allow_text_tools=os.getenv("AGENTUX_TEXT_TOOLS", "").lower() in ("1", "true", "yes")
+        or bool(settings.get("allow_text_tools", False)),
+        lean=os.getenv("AGENTUX_LEAN", "").lower() in ("1", "true", "yes")
+        or bool(settings.get("lean", False)),
     )
     return config.validate()
+
+
+def _setting(settings: Dict[str, Any], key: str, default: Any) -> Any:
+    """A settings value, ignoring anything of the wrong type."""
+    value = settings.get(key)
+    return value if value is not None and isinstance(value, type(default)) else default

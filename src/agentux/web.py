@@ -192,6 +192,8 @@ class AgentuxWebHandler(SimpleHTTPRequestHandler):
         # Hook agent callbacks to SSE
         orig_text_cb = self.agent.on_text
         self.agent.on_text = lambda token: send_sse("chunk", {"delta": token})
+        orig_event_cb = self.agent.on_event
+        self.agent.on_event = lambda role, text: send_sse(role, {"message": text})
 
         try:
             answer = loop.run_until_complete(self.agent.run(prompt, interactive=True))
@@ -238,8 +240,9 @@ class WebServer:
         # meant running agentux --web from inside another project that
         # happened to have an internal/web/static directory served that
         # project's UI instead of Agentux's.
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        candidate = os.path.join(repo_root, "internal", "web", "static")
+        here = os.path.dirname(os.path.abspath(__file__))          # .../src/agentux
+        repo_root = os.path.dirname(os.path.dirname(here))         # .../agentux
+        candidate = os.path.join(repo_root, "src", "agentux", "web", "static")
         if os.path.isdir(candidate):
             return candidate
         cwd = os.getcwd()

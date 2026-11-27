@@ -7,7 +7,7 @@ name = "agentux"
 version = "0.1.0"
 description = "A terminal-native, provider-agnostic AI coding agent"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Agentux contributors" }]
 keywords = ["ai", "agent", "cli", "llm", "openai-compatible", "ollama", "tools"]
@@ -17,19 +17,29 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Code Generators",
 ]
 
-# Deliberately minimal: an HTTP client and terminal rendering. Pydantic is used
-# for the message/tool schemas, which is where validation actually earns its
-# keep. No agent framework is required to build an agent.
+# Deliberately minimal: an HTTP client, terminal rendering, and a prompt
+# toolkit. Pydantic is used for the message/tool schemas, which is where
+# validation actually earns its keep. No agent framework is required to build
+# an agent.
+#
+# Spinners, colour and markdown come from rich, which is already here -- a
+# separate spinner/colour library would be a second way to do one job.
+# prompt_toolkit (via InquirerPy) provides tab-completion and the model picker.
+# Both are optional at runtime: Agentux falls back to a plain prompt and a
+# numbered table when they are missing.
 dependencies = [
     "httpx>=0.27.0",
     "pydantic>=2.6.0",
     "rich>=13.0.0",
+    "prompt_toolkit>=3.0.0",
+    "InquirerPy>=0.3.4",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +53,7 @@ Issues = "https://github.com/agentux/agentux/issues"
 
 [project.scripts]
 agentux = "agentux.cli:cli"
+agentux-solo = "agentux.cli:solo_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -50,3 +61,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# Test the working tree, not whatever copy happens to be installed. Without
+# this, a stale non-editable install in site-packages shadows src/ and the
+# suite fails on imports that the source plainly satisfies.
+pythonpath = ["src"]

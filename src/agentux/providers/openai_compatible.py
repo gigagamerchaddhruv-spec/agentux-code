@@ -23,7 +23,8 @@ from ..errors import (
     UnsupportedToolCallingError,
 )
 from ..models import Message, ToolCall, ToolDefinition
-from .base import BaseProvider
+from ..usage import usage_from_payload
+from .base import BaseProvider, TextCallback
 
 #: Server-sent-event prefix used by the streaming endpoint.
 _SSE_PREFIX = "data:"
@@ -224,6 +225,9 @@ class OpenAICompatibleProvider(BaseProvider):
             payload["tool_choice"] = "auto"
         if stream:
             payload["stream"] = True
+            # Ask for a final usage chunk. Servers that do not support it ignore
+            # the field, so this is safe to send everywhere.
+            payload["stream_options"] = {"include_usage": True}
         return payload
 
     def _headers(self) -> Dict[str, str]:
@@ -285,6 +289,31 @@ class OpenAICompatibleProvider(BaseProvider):
             )
         return message
 
+    def _tool_call_from_deltas(self, deltas: Dict[int, Dict[str, Any]]) -> List[ToolCall]:
+        """Rebuild whole tool calls from the fragments a stream delivers.
+
+        A streamed tool call arrives in pieces: the first chunk carries ``id``
+        and ``name``, later chunks carry more of the ``arguments`` JSON string.
+        Each fragment is indexed, so they are reassembled in index order.
+        """
+        calls: List[ToolCall] = []
+        for index in sorted(deltas):
+            entry = deltas[index]
+            function = entry.get("function") or {}
+            name = function.get("name")
+            if not name:
+                # A call whose name never arrived is unusable; building one from
+                # the arguments alone would be guessing at what to execute.
+                continue
+            calls.append(
+                ToolCall(
+                    id=str(entry.get("id") or f"call_{index}"),
+                    name=str(name),
+                    arguments=_parse_arguments(function.get("arguments")),
+                )
+            )
+        return calls
+
     async def chat(
         self,
         messages: List[Message],
@@ -322,21 +351,29 @@ class OpenAICompatibleProvider(BaseProvider):
                 ) from exc
 
         message = self._parse_message(self._first_choice(data))
+        self.last_usage = usage_from_payload(data)
 
-        if tools and not message.tool_calls and looks_like_emulated_tool_call(
-            message.content, tools
-        ):
-            raise UnsupportedToolCallingError(
-                f"{self.config.model} returned a tool call as plain text instead "
-                "of using native tool calling.\n\n"
-                "Agentux will not run tool calls that were printed as text: "
-                "parsing prose as a command is how an agent runs something it "
-                "was never asked to run. It is treated as an error instead.\n\n"
-                "This model advertises a 'tools' capability but its chat "
-                "template does not emit structured calls. Try a model whose "
-                "template supports tool use (run 'agentux --list-models'), "
-                "update the model with 'ollama pull', or use --no-tools."
-            )
+        if tools and not message.tool_calls:
+            if getattr(self.config, "allow_text_tools", False):
+                from ..text_tools import extract_text_tool_calls
+                extracted_calls, cleaned = extract_text_tool_calls(message.content or "", tools)
+                if extracted_calls:
+                    message.tool_calls = extracted_calls
+                    message.content = cleaned or None
+                    return message
+
+            if looks_like_emulated_tool_call(message.content, tools):
+                raise UnsupportedToolCallingError(
+                    f"{self.config.model} returned a tool call as plain text instead "
+                    "of using native tool calling.\n\n"
+                    "Agentux will not run tool calls that were printed as text: "
+                    "parsing prose as a command is how an agent runs something it "
+                    "was never asked to run. It is treated as an error instead.\n\n"
+                    "This model advertises a 'tools' capability but its chat "
+                    "template does not emit structured calls. Try a model whose "
+                    "template supports tool use (run 'agentux --list-models'), "
+                    "update the model with 'ollama pull', or enable --text-tools."
+                )
 
         return message
 
@@ -480,6 +517,127 @@ class OpenAICompatibleProvider(BaseProvider):
                 raise NetworkError(
                     f"Could not reach the provider at {self.config.base_url}: {exc}"
                 ) from exc
+
+    async def chat_streaming(
+        self,
+        messages: List[Message],
+        tools: Optional[List[ToolDefinition]] = None,
+        on_text: Optional[TextCallback] = None,
+    ) -> Message:
+        """One streaming request that returns a complete message.
+
+        Text deltas go to ``on_text`` as they arrive; tool-call fragments are
+        accumulated and parsed at the end. Both come from the same request, so
+        a step that produces a tool call costs exactly what a step that
+        produces prose costs.
+        """
+        pieces: List[str] = []
+        # Keyed by the stream's own index field: a model may emit several tool
+        # calls in one step, interleaved across chunks.
+        deltas: Dict[int, Dict[str, Any]] = {}
+
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            try:
+                async with client.stream(
+                    "POST",
+                    self.config.chat_url,
+                    headers=self._headers(),
+                    json=self._payload(messages, tools, stream=True),
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        _raise_for_status(
+                            response.status_code,
+                            response.text_content,
+                            self.config.base_url,
+                        )
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith(_SSE_PREFIX):
+                            continue
+                        data = line[len(_SSE_PREFIX):].strip()
+                        if not data or data == _SSE_DONE:
+                            continue
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # A server supporting stream_options sends one final
+                        # chunk with usage and no choices.
+                        chunk_usage = usage_from_payload(chunk)
+                        if chunk_usage:
+                            self.last_usage = chunk_usage
+
+                        for choice in chunk.get("choices") or []:
+                            delta = choice.get("delta") or {}
+
+                            for fragment in delta.get("tool_calls") or []:
+                                if not isinstance(fragment, dict):
+                                    continue
+                                index = fragment.get("index")
+                                index = index if isinstance(index, int) else len(deltas)
+                                slot = deltas.setdefault(
+                                    index, {"id": None, "function": {"name": None, "arguments": ""}}
+                                )
+                                if fragment.get("id"):
+                                    slot["id"] = fragment["id"]
+                                function = fragment.get("function") or {}
+                                if function.get("name"):
+                                    slot["function"]["name"] = (
+                                        slot["function"]["name"] or ""
+                                    ) + str(function["name"])
+                                if function.get("arguments"):
+                                    slot["function"]["arguments"] += str(
+                                        function["arguments"]
+                                    )
+
+                            piece = delta.get("content")
+                            if piece:
+                                pieces.append(piece)
+                                if on_text:
+                                    await on_text(piece)
+            except httpx.TimeoutException as exc:
+                raise ProviderError(
+                    f"The provider did not respond within {self.config.timeout:g}s "
+                    "while streaming."
+                ) from exc
+            except httpx.RequestError as exc:
+                raise NetworkError(
+                    f"Could not reach the provider at {self.config.base_url}: {exc}"
+                ) from exc
+
+        tool_calls = self._tool_call_from_deltas(deltas)
+        content = "".join(pieces) or None
+
+        # When native tool calls are absent, check for text-based tool extraction
+        # if allow_text_tools is enabled, else reject emulated calls in strict mode.
+        if tools and not tool_calls:
+            if getattr(self.config, "allow_text_tools", False):
+                from ..text_tools import extract_text_tool_calls
+                extracted_calls, cleaned = extract_text_tool_calls(content or "", tools)
+                if extracted_calls:
+                    return Message(role="assistant", content=cleaned or None, tool_calls=extracted_calls)
+
+            if looks_like_emulated_tool_call(content or "", tools):
+                raise UnsupportedToolCallingError(
+                    f"{self.config.model} returned a tool call as plain text instead of "
+                    "using native tool calling.\n\n"
+                    "Agentux will not run tool calls that were printed as text: "
+                    "parsing prose as a command is how an agent runs something it was "
+                    "never asked to run. It is treated as an error instead.\n\n"
+                    "This model advertises a 'tools' capability but its chat template "
+                    "does not emit structured calls. Try a model whose template supports "
+                    "tool use (run 'agentux --list-models'), update the model with "
+                    "'ollama pull', or enable --text-tools."
+                )
+
+        if not content and not tool_calls:
+            raise MalformedResponseError(
+                "The provider streamed a response with neither content nor tool "
+                "calls. The model may have returned nothing."
+            )
+
+        return Message(role="assistant", content=content, tool_calls=tool_calls or None)
 
 
 __all__ = ["OpenAICompatibleProvider"]

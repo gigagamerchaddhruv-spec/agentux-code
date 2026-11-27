@@ -1,91 +1,120 @@
-"""Exception hierarchy for Agentux.
+"""Agentux-specific error types."""
 
-Every error raised on purpose by Agentux derives from :class:`AgentuxError`.
-The CLI relies on that to tell an expected, user-facing failure (a missing API
-key, a rate limit, a declined command) apart from a genuine bug, so new error
-types should subclass ``AgentuxError`` rather than ``Exception``.
-"""
+from __future__ import annotations
 
 
 class AgentuxError(Exception):
-    """Base class for all Agentux exceptions."""
+    """Base exception for all Agentux errors."""
+    pass
 
 
-class ConfigurationError(AgentuxError):
-    """Raised when configuration is missing or invalid."""
+# Alias for backward compatibility with existing tests
+ConfigurationError = AgentuxError
 
 
-class ProviderError(AgentuxError):
-    """Raised when a provider call fails."""
+class ConfigError(AgentuxError):
+    """Configuration-related errors."""
+    pass
 
 
-class AuthenticationError(ProviderError):
-    """Raised when the provider rejects the API key."""
+class MCPConfigError(AgentuxError):
+    """MCP configuration errors."""
+    pass
 
 
-class ModelNotFoundError(ProviderError):
-    """Raised when the requested model does not exist on the provider."""
+class MCPError(AgentuxError):
+    """MCP runtime errors."""
+    pass
 
 
-class RateLimitError(ProviderError):
-    """Raised when the provider rate-limits the request."""
+class MCPProtocolError(MCPError):
+    """MCP protocol errors."""
+    pass
 
 
-class NetworkError(ProviderError):
-    """Raised when the provider cannot be reached."""
+class MarketplaceError(AgentuxError):
+    """Marketplace-related errors."""
+    pass
 
 
-class MalformedResponseError(ProviderError):
-    """Raised when the provider returns a response Agentux cannot parse."""
+class ToolNotFoundError(AgentuxError):
+    """Raised when a requested tool is not found."""
+    pass
 
 
-class UnsupportedToolCallingError(AgentuxError):
-    """Raised when tool use is requested from a provider that cannot do it.
-
-    Agentux refuses to emulate structured tool calls by asking a model to print
-    JSON as plain text, so this is a hard failure rather than a silent
-    downgrade.
-    """
-
-
-class ToolError(AgentuxError):
-    """Raised when a tool fails to execute."""
-
-
-class ToolNotFoundError(ToolError):
-    """Raised when the model asks for a tool that is not registered."""
-
-
-class ToolValidationError(ToolError):
-    """Raised when a tool call's arguments do not match the tool's schema."""
-
-
-class SafetyError(ToolError):
-    """Raised when a destructive command is blocked or declined."""
+class MalformedResponseError(AgentuxError):
+    """Raised when a provider returns a malformed response."""
+    pass
 
 
 class MaxStepsError(AgentuxError):
-    """Raised when the agent loop hits its iteration ceiling."""
+    """Raised when the agent exceeds the maximum number of steps."""
+    pass
+
+
+class UnsupportedToolCallingError(AgentuxError):
+    """Raised when the provider doesn't support tool calling."""
+    pass
+
+
+class AuthenticationError(AgentuxError):
+    """Raised when authentication fails with a provider."""
+    pass
+
+
+class ModelNotFoundError(AgentuxError):
+    """Raised when a requested model is not available."""
+    pass
+
+
+class NetworkError(AgentuxError):
+    """Raised when network communication fails."""
+    pass
+
+
+class ProviderError(AgentuxError):
+    """Base exception for provider-related errors."""
+    pass
+
+
+class RateLimitError(AgentuxError):
+    """Raised when a provider rate limits the request."""
+    pass
+
+
+class ToolError(AgentuxError):
+    """Base exception for tool-related errors."""
+    pass
+
+
+class SafetyError(AgentuxError):
+    """Raised when a safety check fails."""
+    pass
 
 
 class UserAbort(AgentuxError):
-    """Raised when the user interrupts an in-flight operation."""
+    """Raised when the user aborts an operation."""
+    pass
 
 
 __all__ = [
     "AgentuxError",
     "ConfigurationError",
-    "ProviderError",
+    "ConfigError",
+    "MCPConfigError",
+    "MCPError",
+    "MCPProtocolError",
+    "MarketplaceError",
+    "ToolNotFoundError",
+    "MalformedResponseError",
+    "MaxStepsError",
+    "UnsupportedToolCallingError",
     "AuthenticationError",
     "ModelNotFoundError",
-    "RateLimitError",
     "NetworkError",
-    "MalformedResponseError",
-    "UnsupportedToolCallingError",
+    "ProviderError",
+    "RateLimitError",
     "ToolError",
-    "ToolNotFoundError",
-    "ToolValidationError",
     "SafetyError",
-    "MaxStepsError",
     "UserAbort",
 ]

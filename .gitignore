@@ -31,3 +31,8 @@ htmlcov/
 *.key
 *.pem
 secrets.*
+
+# Go
+bin/
+*.exe
+*.test

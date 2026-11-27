@@ -25,6 +25,10 @@ class ToolRegistry:
         """Register a tool, replacing any existing tool with the same name."""
         self._tools[tool.name] = tool
 
+    def deregister(self, name: str) -> None:
+        """Remove a tool by name. Does nothing if it is not registered."""
+        self._tools.pop(name, None)
+
     def get(self, name: str) -> BaseTool:
         """Return a registered tool, or raise :class:`ToolNotFoundError`."""
         tool = self._tools.get(name)

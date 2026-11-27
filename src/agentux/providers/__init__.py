@@ -7,7 +7,6 @@ change to the agent is required.
 
 from __future__ import annotations
 
-from typing import Optional
 
 from ..config import Config
 from .base import BaseProvider

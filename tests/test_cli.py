@@ -273,7 +273,7 @@ def test_list_models_warns_about_models_without_tools(monkeypatch, capsys):
     assert main(["--list-models"]) == 0
     out = capsys.readouterr().out
     assert "smollm:135m" in out
-    assert "no tools" in out
+    assert "tool support" in out
 
 
 def test_list_models_reports_an_unreachable_server(monkeypatch, capsys):

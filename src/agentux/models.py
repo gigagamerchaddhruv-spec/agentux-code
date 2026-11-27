@@ -55,6 +55,33 @@ class Message(BaseModel):
             payload["tool_call_id"] = self.tool_call_id
         return payload
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> Message:
+        role = data.get("role", "user")
+        content = data.get("content")
+        tool_call_id = data.get("tool_call_id")
+        raw_calls = data.get("tool_calls")
+        parsed_calls = None
+        if raw_calls:
+            parsed_calls = []
+            for c in raw_calls:
+                fn = c.get("function", {}) if isinstance(c.get("function"), dict) else {}
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    import json
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                parsed_calls.append(
+                    ToolCall(
+                        id=c.get("id", ""),
+                        name=fn.get("name", c.get("name", "")),
+                        arguments=args if isinstance(args, dict) else {},
+                    )
+                )
+        return cls(role=role, content=content, tool_calls=parsed_calls, tool_call_id=tool_call_id)
+
 
 class ToolDefinition(BaseModel):
     """A tool advertised to the model.
