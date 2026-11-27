@@ -29,6 +29,7 @@ The model provider is interchangeable infrastructure. Agentux speaks the OpenAI-
 - `agentux --solo` — run Solo in the interactive TUI
 - `agentux --solo-engine "<question>"` — one-shot autonomous research cycle
 - `agentux-solo` — dedicated Solo entry point
+- `agentux --solo --model <name>` — use a different model (e.g. `granite4.1:3b`); defaults to `qwen2.5:0.5b`
 - Memory store at `~/.agentux/knowledge.db`, overridable with `AGENTUX_SOLO_MEMORY`
 
 **Deterministic research enforcement.** The engine does not trust a small model to remember to look things up. It searches memory first, nudges the model when it tries to answer without researching, and auto-saves web results so the cycle completes even when the model cannot emit a well-formed tool call.

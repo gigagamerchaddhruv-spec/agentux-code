@@ -176,15 +176,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--system-prompt", default=None, help="Override the built-in system prompt."
     )
     parser.add_argument(
-        "-W", "--web", action="store_true", help="Launch embedded developer Web UI console."
-    )
-    parser.add_argument(
-        "--port", type=int, default=8080, help="Port for the embedded Web UI console (default: 8080)."
-    )
-    parser.add_argument(
-        "--open", action="store_true", help="Automatically open browser when Web UI starts."
-    )
-    parser.add_argument(
         "--text-tools",
         action="store_true",
         default=False,
@@ -517,15 +508,26 @@ def build_registry(config: Config, args: argparse.Namespace, mcp_manager=None,
     return registry
 
 
-def enable_solo(agent, config: Config, allow_tools: bool = True) -> None:
+def enable_solo(agent, config: Config, allow_tools: bool = True, args=None) -> None:
     """Apply the Agentux Solo preset to an agent that has already been built.
 
     Called from :func:`build_agent` when ``--solo`` is passed, so every run
     mode (prompt, interactive, TUI, web) gets the same treatment.
+
+    An explicitly passed ``--model`` flag takes precedence over the Solo
+    preset's default model, so ``agentux --solo --model granite4.1:3b`` uses
+    granite4.1:3b rather than qwen2.5:0.5b.
     """
     from .solo import apply_solo, solo_preset
 
-    apply_solo(agent, solo_preset(config.working_dir))
+    preset = solo_preset(config.working_dir)
+    apply_solo(agent, preset)
+
+    # Honor --model over the preset default.
+    if args is not None and getattr(args, "model", None):
+        config.model = args.model
+        agent.config.model = args.model
+
     if not allow_tools:
         # '--no-tools --solo' means what it says: the memory still works
         # through automatic recall, but the model gets no explicit tools.
@@ -559,7 +561,7 @@ def build_agent(
         context_manager=ContextManager(),
     )
     if getattr(args, "solo", False):
-        enable_solo(agent, config, allow_tools=not getattr(args, "no_tools", False))
+        enable_solo(agent, config, allow_tools=not getattr(args, "no_tools", False), args=args)
     return agent
 
 
@@ -1077,29 +1079,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         manager, warnings = asyncio.run(attach_mcp(config, args))
         try:
-            if getattr(args, "web", False):
-                from .web import WebServer
-                agent = build_agent(config, args, mcp_manager=manager, stream=stream)
-                try:
-                    web_server = WebServer(agent, config, port=getattr(args, "port", 8080))
-                except RuntimeError as exc:
-                    console.print(f"[bold red]⌋ web console error[/bold red] {exc}")
-                    return 1
-                web_server.start(open_browser=getattr(args, "open", False))
-                console.print(f"\n  [bold #00ff88]⏣ AGENTUX · Web Console[/bold #00ff88]\n")
-                console.print(f"  • Local URL:      [bold cyan]{web_server.url}[/bold cyan]")
-                console.print(f"  • Workspace:      {config.working_dir}")
-                console.print(f"  • Active Model:   {config.model}\n")
-                console.print("  [dim]Press Ctrl+C to terminate web server.[/dim]\n")
-                try:
-                    import time
-                    while True:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    web_server.stop()
-                    console.print("\n[dim]Shut down Agentux web server.[/dim]")
-                    return 0
-
             if args.prompt:
                 if getattr(args, "solo_engine", False):
                     return asyncio.run(
